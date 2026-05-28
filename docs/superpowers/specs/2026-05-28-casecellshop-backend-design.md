@@ -83,11 +83,23 @@ Os processos ficam separados operacionalmente, mas compartilham libs de banco, f
 products
   id, sku, name, description, imageUrl, active, updatedAt
 
+device_models
+  id, brand, model, slug, active, updatedAt
+
+product_compatibilities
+  productId, deviceModelId
+
+product_stats
+  productId, popularityScore, viewsCount, soldCount, updatedAt
+
 product_prices
   productId, priceCents, currency, updatedAt
 
 inventory
   productId, erpQty, reservedQty, availableQty, version, updatedAt
+
+catalog_versions
+  scope, version, updatedAt
 
 orders
   id, customerId, idempotencyKey, status, totalCents, currency,
@@ -117,9 +129,17 @@ Constraints e indices essenciais:
 - `UNIQUE (customerId, idempotencyKey)` em `orders`.
 - `UNIQUE (customerId, key)` em `idempotency_keys`.
 - `UNIQUE (sku)` em `products`.
+- `UNIQUE (slug)` em `device_models`.
+- `UNIQUE (productId, deviceModelId)` em `product_compatibilities`.
+- `UNIQUE (scope)` em `catalog_versions`.
+- Indices em `product_compatibilities(deviceModelId, productId)`.
+- Indices em `product_prices(priceCents)` para ordenacao por preco.
+- Indices em `product_stats(popularityScore)` para ordenacao por relevancia.
 - Indices em `outbox_events(status, createdAt)` e `orders(status, updatedAt)`.
 
 `order_items` guarda snapshot de `sku`, `name` e `unitPriceCents` para preservar historico mesmo se o produto for inativado depois.
+
+`product_compatibilities` permite que uma capinha seja compativel com mais de um modelo de celular. Isso evita acoplar cada produto a um unico aparelho.
 
 ## Estados de Pedido
 
@@ -138,7 +158,7 @@ O status inicial do pedido criado pelo checkout e `PENDING_ERP`. A resposta HTTP
 GET /health
 GET /metrics
 
-GET /products
+GET /products?device=:slug&brand=:brand&sort=:sort&page=:page&pageSize=:pageSize
 GET /products/:id
 GET /products/:id/availability
 
@@ -179,25 +199,65 @@ Respostas esperadas:
 
 `GET /orders/by-idempotency-key/:key` tambem exige `X-Customer-Id`, mantendo a consulta escopada ao usuario.
 
+Filtros e ordenacoes aceitos em `GET /products`:
+
+```text
+device     slug do modelo de celular, como iphone-15 ou galaxy-s24
+brand      marca do aparelho, como apple ou samsung
+sort       relevance, price_asc ou price_desc
+page       pagina, iniciando em 1
+pageSize   tamanho da pagina, com limite maximo definido pela API
+```
+
+`sort=relevance` usa uma regra simples e explicavel para a mini-tarefa:
+
+```text
+popularityScore DESC, products.updatedAt DESC
+```
+
+A disponibilidade nao entra como criterio forte da relevancia, porque checkout altera estoque com alta frequencia. A lista fica estavel por filtro/sort, e a disponibilidade e hidratada por produto com TTL curto.
+
 ## Fluxo GET /products
 
 1. API recebe a requisicao e cria ou propaga `requestId` e `correlationId`.
-2. Busca Redis em `products:list:v1:active`.
-3. Em cache hit, retorna a lista e incrementa `cache_hits_total`.
-4. Em cache miss, busca produtos ativos no Postgres com preco e disponibilidade resumida.
-5. Usa lock curto no Redis, como `lock:products:list`, para reduzir cache stampede.
-6. Se adquirir o lock, grava a resposta no Redis com TTL e retorna.
-7. Se nao adquirir o lock, aguarda brevemente, tenta reler o cache e, se necessario, retorna direto do Postgres.
-8. Se Redis estiver indisponivel, registra erro e faz fallback para Postgres.
-9. O ERP nao e chamado nesse endpoint.
+2. Normaliza filtros e ordenacao aceitos: `device`, `brand`, `sort`, `page` e `pageSize`.
+3. Le a versao atual do catalogo em `catalog_versions`, podendo manter copia curta em Redis como `catalog:version:products`.
+4. Monta uma chave canonica de query, sempre com parametros na mesma ordem.
+5. Busca Redis pela lista de IDs e metadados da pagina.
+6. Em cache hit, hidrata cards e disponibilidade via Redis e incrementa `cache_hits_total`.
+7. Em cache miss, usa lock curto no Redis por chave de query para reduzir cache stampede.
+8. Se adquirir o lock, consulta Postgres com filtros, joins e ordenacao, grava a pagina no Redis e retorna.
+9. Se nao adquirir o lock, aguarda jitter curto e tenta reler o Redis.
+10. Se ainda nao houver cache fresco, retorna stale cache quando existir valor expirado recente.
+11. Apenas como ultimo recurso consulta Postgres, com limite de concorrencia por chave para nao transformar o banco na nova vitima do stampede.
+12. Se Redis estiver indisponivel, registra erro e usa Postgres como fallback degradado.
+13. O ERP nao e chamado nesse endpoint.
+
+Exemplo:
+
+```http
+GET /products?device=iphone-15&sort=price_asc&page=1&pageSize=24
+```
+
+Chaves Redis derivadas:
+
+```text
+products:query:v42:brand=*:device=iphone-15:sort=price_asc:page=1:size=24
+product:card:v42:{productId}
+product:availability:{productId}
+```
+
+A chave `products:query` armazena IDs ordenados e metadados de paginacao. O card do produto armazena dados menos volateis como nome, SKU, imagem e preco. A disponibilidade fica separada por produto, com TTL menor.
+
+Se a query existir mas algum card ou disponibilidade estiver ausente, a API recompõe apenas a chave faltante. Isso evita jogar fora a pagina inteira por causa de um item parcialmente expirado.
 
 TTLs sugeridos:
 
 ```text
-products:list:v1:active       60s a 120s
-product:detail:{id}:v1        5min
-product:availability:{id}:v1  15s a 30s
-product:price:{id}:v1         60s
+products:query:v{version}:...  60s a 120s, com stale por 5min a 10min
+product:card:v{version}:{id}   5min
+product:detail:v{version}:{id} 5min
+product:availability:{id}      15s a 30s
 ```
 
 Refresh-ahead pode ser demonstrado por job simples para produtos mais acessados, medidos por contadores Redis como `product:views:{id}`.
@@ -277,35 +337,58 @@ Produtos novos, alterados ou removidos entram pelo fluxo de sync:
 Fluxo:
 
 1. Worker ou API chama `GET /erp/products` no fake ERP.
-2. Recebe `sku`, nome, descricao, preco, estoque e status.
-3. Faz upsert em `products`, `product_prices` e `inventory`.
+2. Recebe `sku`, nome, descricao, preco, estoque, status e compatibilidades de aparelho.
+3. Faz upsert em `products`, `device_models`, `product_compatibilities`, `product_prices` e `inventory`.
 4. Produtos novos entram como `active = true`.
 5. Produtos removidos ou desativados no ERP viram `active = false`.
 6. Produtos inativos nao aparecem em `GET /products`.
-7. Cache relacionado e invalidado ou atualizado ativamente.
+7. Alteracoes em produto, preco, status ativo ou compatibilidade incrementam `catalog_versions`.
+8. Cache relacionado e invalidado ou atualizado ativamente.
 
 Nao ha hard delete de produtos para preservar historico de pedidos.
 
 ## Cache
 
-A estrategia principal e cache-aside:
+A estrategia principal e cache-aside por consulta normalizada:
 
-1. API tenta Redis.
-2. Em miss, consulta Postgres.
-3. API popula Redis com TTL.
-4. Em falha do Redis, a API usa Postgres como fallback.
+1. API normaliza filtros, ordenacao e paginacao.
+2. API monta uma chave Redis deterministica.
+3. Em hit, retorna IDs da pagina e hidrata dados auxiliares via Redis.
+4. Em miss, consulta Postgres e popula Redis com TTL.
+5. Em falha do Redis, a API usa Postgres como fallback degradado.
+
+Exemplo de chave:
+
+```text
+products:query:v42:brand=*:device=iphone-15:sort=price_asc:page=1:size=24
+```
+
+O cache de listagem nao deve carregar dados altamente volateis como disponibilidade definitiva. A regra e:
+
+```text
+Cache de query        filtros + sort + paginacao -> IDs e metadados
+Cache de card         nome, sku, imagem, preco
+Cache de disponibilidade availableQty e inStock por produto
+Checkout              sempre Postgres, nunca Redis
+```
+
+`catalog_versions` invalida familias inteiras de chaves sem precisar apagar todas manualmente. Quando sync ERP altera produto, preco, status ativo ou compatibilidade, a versao muda de `v42` para `v43`. Chaves antigas expiram por TTL. Checkout nao incrementa a versao de catalogo; ele invalida apenas disponibilidade dos produtos afetados.
 
 Invalida ativa:
 
-- sync ERP invalida catalogo, detalhe, preco e disponibilidade;
+- sync ERP incrementa versao de catalogo e invalida disponibilidade quando estoque base muda;
 - checkout invalida disponibilidade dos produtos comprados;
 - reprocessamento administrativo de DLQ pode invalidar pedido e disponibilidade.
 
 Protecao contra cache stampede:
 
-- lock curto por chave quente;
-- espera curta e releitura do cache;
-- fallback para Postgres se outro processo estiver recompondo.
+- lock curto por chave quente ou por query normalizada;
+- jitter e releitura do Redis para requests concorrentes;
+- stale-while-revalidate quando houver valor expirado recente;
+- stale-if-error quando Redis/Postgres estiverem degradados e houver stale aceitavel;
+- fallback para Postgres apenas como ultimo recurso, com limite de concorrencia por chave.
+
+O fallback para Postgres nao e a principal protecao contra stampede. Ele existe para disponibilidade degradada. A protecao real vem de lock, jitter, stale cache e limite de concorrencia.
 
 ## Mensageria, Retry e DLQ
 
@@ -421,6 +504,14 @@ Testes de integracao:
 
 - `GET /products` retorna do Redis em cache hit.
 - `GET /products` cai para Postgres em cache miss.
+- `GET /products?device=iphone-15` retorna apenas produtos compativeis com o modelo.
+- `GET /products?brand=apple` retorna apenas produtos compativeis com aparelhos da marca.
+- `sort=price_asc` e `sort=price_desc` ordenam pelo preco atual.
+- `sort=relevance` ordena por `popularityScore` e recencia.
+- parametros em ordem diferente geram a mesma chave canonica de cache.
+- checkout invalida `product:availability:{id}` sem invalidar todas as queries de listagem.
+- sync ERP que altera preco, produto, status ou compatibilidade incrementa `catalog_versions`.
+- cache stampede em query quente gera uma unica recomposicao principal e concorrentes usam releitura ou stale cache.
 - Redis indisponivel nao derruba leitura da vitrine.
 - `POST /checkout` cria pedido, itens, baixa estoque e outbox na mesma transacao.
 - mesma chave, mesmo usuario e mesmo payload nao duplica pedido nem estoque.
@@ -437,9 +528,11 @@ Testes K6:
 
 ```text
 tests/k6/products-load.js
-  leitura massiva de GET /products e GET /products/:id,
+  leitura massiva de GET /products, GET /products/:id e queries filtradas por aparelho,
   medicao de p95/p99, taxa de erro e cache hit ratio,
-  validacao de que ERP nao recebe chamadas de vitrine.
+  mistura de sort=relevance, sort=price_asc e sort=price_desc,
+  validacao de que ERP nao recebe chamadas de vitrine,
+  validacao indireta de que queries quentes nao geram tempestade de leituras no Postgres.
 
 tests/k6/checkout-concurrency.js
   checkouts concorrentes para SKUs com estoque limitado,
@@ -459,6 +552,7 @@ npm run seed:demo
 
 npm run seed:large
   10.000 produtos, precos variados, estoques variados,
+  modelos de celular variados, compatibilidades muitos-para-muitos,
   alguns produtos inativos e alguns SKUs quentes para cache.
 ```
 
