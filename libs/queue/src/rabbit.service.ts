@@ -49,6 +49,7 @@ export class RabbitService implements OnModuleDestroy {
   }
 
   async publishToRetry(payload: unknown, options: PublishOptions = {}) {
+    await this.ensureTopology();
     const channel = await this.getChannel();
 
     channel.sendToQueue('orders.billing.retry.q', Buffer.from(JSON.stringify(payload)), {
@@ -59,6 +60,7 @@ export class RabbitService implements OnModuleDestroy {
   }
 
   async publishToDlq(payload: unknown, options: PublishOptions = {}) {
+    await this.ensureTopology();
     const channel = await this.getChannel();
 
     channel.sendToQueue('orders.billing.dlq', Buffer.from(JSON.stringify(payload)), {

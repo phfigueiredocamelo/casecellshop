@@ -117,6 +117,49 @@ describe('api observability foundation', () => {
     ]);
   });
 
+  it('hydrates cached product ids through fresh product lookups', async () => {
+    const service = new ProductsService(
+      {
+        catalogVersion: {
+          findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 11 })
+        },
+        product: {
+          findMany: jest.fn()
+        }
+      } as any,
+      {
+        getJson: jest.fn().mockResolvedValue(['prod-1']),
+        setJson: jest.fn().mockResolvedValue(undefined),
+        acquireLock: jest.fn().mockResolvedValue(false),
+        releaseLock: jest.fn().mockResolvedValue(undefined)
+      } as any
+    );
+
+    jest.spyOn(service, 'getProductById').mockResolvedValue({
+      id: 'prod-1',
+      sku: 'SKU-1',
+      name: 'Capa iPhone 15',
+      imageUrl: null,
+      brand: 'CaseCell',
+      priceCents: 5990,
+      currency: 'BRL',
+      availableQty: 7,
+      inStock: true
+    });
+
+    const response = await service.listProducts({
+      device: 'apple-iphone-15'
+    });
+
+    expect(service.getProductById).toHaveBeenCalledWith('prod-1');
+    expect(response.items).toEqual([
+      expect.objectContaining({
+        id: 'prod-1',
+        availableQty: 7
+      })
+    ]);
+  });
+
   it('invalidates only product availability and card caches for affected products', async () => {
     const deleteSpy = jest.fn().mockResolvedValue(undefined);
     const service = new ProductsService(

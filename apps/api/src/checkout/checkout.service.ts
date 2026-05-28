@@ -63,9 +63,12 @@ export class CheckoutService {
     const normalizedBody = this.normalizeRequest(body);
     const requestHash = this.hashRequest(normalizedBody);
     const cacheKeysToInvalidate = normalizedBody.items.map((item) => item.productId);
+    const idempotencyLockKey = `${customerId}:${idempotencyKey}`;
 
     const result = await this.prisma.$transaction(
       async (tx) => {
+        await this.acquireIdempotencyLock(tx, idempotencyLockKey);
+
         const existing = await tx.idempotencyKey.findUnique({
           where: {
             customerId_key: {
@@ -250,5 +253,15 @@ export class CheckoutService {
 
   private hashRequest(body: CheckoutRequest) {
     return createHash('sha256').update(JSON.stringify(body)).digest('hex');
+  }
+
+  private async acquireIdempotencyLock(tx: Prisma.TransactionClient, lockKey: string) {
+    if (typeof (tx as Prisma.TransactionClient & { $executeRaw?: unknown }).$executeRaw !== 'function') {
+      return;
+    }
+
+    await (tx as Prisma.TransactionClient & {
+      $executeRaw: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>;
+    }).$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
   }
 }

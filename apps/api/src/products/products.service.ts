@@ -23,6 +23,8 @@ export interface ProductListItem {
   inStock: boolean;
 }
 
+type ProductQueryCacheEntry = string[];
+
 @Injectable()
 export class ProductsService {
   constructor(
@@ -34,11 +36,13 @@ export class ProductsService {
     const normalized = this.normalizeQuery(query);
     const catalogVersion = await this.getCatalogVersion();
     const queryKey = this.buildProductsQueryCacheKey(catalogVersion, normalized);
-    const cached = await this.cache.getJson<ProductListItem[]>(queryKey).catch(() => null);
+    const cachedIds = await this.cache.getJson<ProductQueryCacheEntry>(queryKey).catch(() => null);
 
-    if (cached) {
+    if (cachedIds) {
+      const items = await this.hydrateProducts(cachedIds);
+
       return {
-        items: cached,
+        items,
         meta: {
           ...normalized,
           catalogVersion,
@@ -54,7 +58,11 @@ export class ProductsService {
       const items = await this.fetchProducts(normalized);
 
       if (hasLock) {
-        await this.cache.setJson(queryKey, items, 90).catch(() => undefined);
+        await this.cache.setJson(
+          queryKey,
+          items.map((item) => item.id),
+          90
+        ).catch(() => undefined);
       }
 
       return {
@@ -185,6 +193,12 @@ export class ProductsService {
       availableQty: product.inventory?.availableQty ?? 0,
       inStock: (product.inventory?.availableQty ?? 0) > 0
     }));
+  }
+
+  private async hydrateProducts(ids: string[]) {
+    const products = await Promise.all(ids.map((id) => this.getProductById(id)));
+
+    return products.filter((product): product is ProductListItem => product !== null);
   }
 
   private buildOrderBy(sort: Required<ProductQuery>['sort']): Prisma.ProductOrderByWithRelationInput[] {
