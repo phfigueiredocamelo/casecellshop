@@ -1,0 +1,209 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrderStatus {
+  PENDING_ERP
+  BILLED
+  ERP_FAILED
+}
+
+enum IdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+enum IntegrationAttemptStatus {
+  SUCCESS
+  FAILED
+  DLQ
+}
+
+model Product {
+  id                String                 @id @default(cuid())
+  sku               String                 @unique
+  name              String
+  description       String?
+  imageUrl          String?
+  brand             String?
+  active            Boolean                @default(true)
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  compatibilities   ProductCompatibility[]
+  inventory         Inventory?
+  orderItems        OrderItem[]
+  price             ProductPrice?
+  snapshots         ErpSnapshot[]
+  stats             ProductStats?
+}
+
+model DeviceModel {
+  id              String                 @id @default(cuid())
+  brand           String
+  model           String
+  slug            String                 @unique
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  compatibilities ProductCompatibility[]
+
+  @@unique([brand, model])
+}
+
+model ProductCompatibility {
+  productId     String
+  deviceModelId String
+  createdAt     DateTime    @default(now())
+  deviceModel   DeviceModel @relation(fields: [deviceModelId], references: [id], onDelete: Cascade)
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([productId, deviceModelId])
+  @@index([deviceModelId])
+}
+
+model ProductPrice {
+  productId   String   @id
+  priceCents  Int
+  currency    String   @default("BRL")
+  updatedAt   DateTime @updatedAt
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([priceCents])
+}
+
+model Inventory {
+  productId     String   @id
+  erpQty        Int
+  reservedQty   Int      @default(0)
+  availableQty  Int
+  version       Int      @default(0)
+  updatedAt     DateTime @updatedAt
+  product       Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([availableQty])
+}
+
+model ProductStats {
+  productId        String   @id
+  popularityScore  Int      @default(0)
+  viewCount        Int      @default(0)
+  soldCount        Int      @default(0)
+  updatedAt        DateTime @updatedAt
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([popularityScore])
+}
+
+model CatalogVersion {
+  key       String   @id
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+}
+
+model Order {
+  id               String               @id @default(cuid())
+  customerId       String
+  idempotencyKey   String
+  status           OrderStatus
+  totalCents       Int
+  currency         String               @default("BRL")
+  erpInvoiceId     String?
+  failureReason    String?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  idempotencyEntry IdempotencyKey?
+  items            OrderItem[]
+  outboxEvents     OutboxEvent[]
+  attempts         IntegrationAttempt[]
+
+  @@unique([customerId, idempotencyKey])
+  @@index([status, createdAt])
+}
+
+model OrderItem {
+  id             String   @id @default(cuid())
+  orderId        String
+  productId      String
+  sku            String
+  productName    String
+  quantity       Int
+  unitPriceCents Int
+  createdAt      DateTime @default(now())
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product        Product  @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model IdempotencyKey {
+  id           String            @id @default(cuid())
+  customerId   String
+  key          String
+  requestHash  String
+  status       IdempotencyStatus
+  responseBody Json?
+  expiresAt    DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  orderId      String?           @unique
+  order        Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@unique([customerId, key])
+  @@index([status, createdAt])
+}
+
+model OutboxEvent {
+  id            String       @id @default(cuid())
+  aggregateType String
+  aggregateId   String
+  eventType     String
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  lastError     String?
+  createdAt     DateTime     @default(now())
+  publishedAt   DateTime?
+  orderId       String?
+  order         Order?       @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([aggregateType, aggregateId])
+}
+
+model IntegrationAttempt {
+  id            String                   @id @default(cuid())
+  orderId        String
+  operation      String
+  attemptNumber  Int
+  status         IntegrationAttemptStatus
+  errorMessage   String?
+  correlationId  String?
+  createdAt      DateTime                 @default(now())
+  order          Order                    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, operation, attemptNumber])
+  @@index([status, createdAt])
+}
+
+model ErpSnapshot {
+  id              String   @id @default(cuid())
+  productId       String
+  erpAvailableQty Int
+  erpPriceCents   Int
+  capturedAt      DateTime @default(now())
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, capturedAt])
+}
