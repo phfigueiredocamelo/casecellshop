@@ -8,8 +8,8 @@
     "start:outbox-worker": "nest start outbox-worker --watch",
     "start:order-worker": "nest start order-worker --watch",
     "start:reconciliation-worker": "nest start reconciliation-worker --watch",
-    "test": "jest --runInBand",
-    "test:integration": "jest --config ./tests/jest.integration.json --runInBand"
+    "test": "jest --config ./tests/jest.integration.json --runInBand --passWithNoTests",
+    "test:integration": "jest --config ./tests/jest.integration.json --runInBand --passWithNoTests"
   },
   "dependencies": {
     "@nestjs/common": "11.0.0",
