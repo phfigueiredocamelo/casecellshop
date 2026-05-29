@@ -1,0 +1,5 @@
+# API health check
+# http://localhost:3000/health
+
+# Fake ERP health check
+http://localhost:3001/health
