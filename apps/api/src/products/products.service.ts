@@ -58,11 +58,14 @@ export class ProductsService {
       const items = await this.fetchProducts(normalized);
 
       if (hasLock) {
-        await this.cache.setJson(
-          queryKey,
-          items.map((item) => item.id),
-          90
-        ).catch(() => undefined);
+        await Promise.all([
+          this.cache.setJson(
+            queryKey,
+            items.map((item) => item.id),
+            90
+          ).catch(() => undefined),
+          ...items.map((item) => this.cacheProductCard(catalogVersion, item))
+        ]);
       }
 
       return {
@@ -101,7 +104,7 @@ export class ProductsService {
       return null;
     }
 
-    await this.cache.setJson(cacheKey, product, 300).catch(() => undefined);
+    await this.cacheProductCard(catalogVersion, product);
 
     return product;
   }
@@ -199,6 +202,12 @@ export class ProductsService {
     const products = await Promise.all(ids.map((id) => this.getProductById(id)));
 
     return products.filter((product): product is ProductListItem => product !== null);
+  }
+
+  private async cacheProductCard(catalogVersion: number, product: ProductListItem) {
+    await this.cache
+      .setJson(`product:card:v${catalogVersion}:${product.id}`, product, 300)
+      .catch(() => undefined);
   }
 
   private buildOrderBy(sort: Required<ProductQuery>['sort']): Prisma.ProductOrderByWithRelationInput[] {

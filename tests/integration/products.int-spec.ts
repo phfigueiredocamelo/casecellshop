@@ -186,6 +186,55 @@ describe('api observability foundation', () => {
     ]);
   });
 
+  it('warms product card caches when populating a product query cache miss', async () => {
+    const setJson = jest.fn().mockResolvedValue(undefined);
+    const service = new ProductsService(
+      {
+        catalogVersion: {
+          findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 12 })
+        },
+        product: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'prod-1',
+              sku: 'SKU-1',
+              name: 'Capa iPhone 15',
+              imageUrl: null,
+              brand: 'CaseCell',
+              price: { priceCents: 5990, currency: 'BRL' },
+              inventory: { availableQty: 7 }
+            }
+          ])
+        }
+      } as any,
+      {
+        getJson: jest.fn().mockResolvedValue(null),
+        setJson,
+        acquireLock: jest.fn().mockResolvedValue(true),
+        releaseLock: jest.fn().mockResolvedValue(undefined)
+      } as any
+    );
+
+    await service.listProducts({
+      device: 'apple-iphone-15'
+    });
+
+    expect(setJson).toHaveBeenCalledWith(
+      'products:query:v12:brand=all:device=apple-iphone-15:sort=relevance:page=1:size=24',
+      ['prod-1'],
+      90
+    );
+    expect(setJson).toHaveBeenCalledWith(
+      'product:card:v12:prod-1',
+      expect.objectContaining({
+        id: 'prod-1',
+        priceCents: 5990,
+        availableQty: 7
+      }),
+      300
+    );
+  });
+
   it('invalidates only product availability and card caches for affected products', async () => {
     const deleteSpy = jest.fn().mockResolvedValue(undefined);
     const service = new ProductsService(
