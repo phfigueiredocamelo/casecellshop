@@ -1,6 +1,8 @@
 import { ReconciliationRunner } from '../../apps/reconciliation-worker/src/reconciliation.runner';
 import { OutboxPublisher } from '../../apps/outbox-worker/src/outbox.publisher';
+import { WorkerRunnerService as OutboxWorkerRunnerService } from '../../apps/outbox-worker/src/worker-runner.service';
 import { BillingConsumer } from '../../apps/order-worker/src/billing.consumer';
+import { WorkerRunnerService as OrderWorkerRunnerService } from '../../apps/order-worker/src/worker-runner.service';
 import { ErpService } from '../../apps/fake-erp/src/erp/erp.service';
 import { ErpCatalogProduct } from '../../prisma/catalog-data';
 
@@ -250,6 +252,33 @@ describe('outbox publisher', () => {
   });
 });
 
+describe('outbox worker runner', () => {
+  it('starts publishing outbox events immediately and keeps polling', async () => {
+    jest.useFakeTimers();
+    const publishPending = jest.fn().mockResolvedValue(undefined);
+    const service = new (OutboxWorkerRunnerService as any)({
+      publishPending
+    });
+
+    const previousHeartbeat = process.env.WORKER_HEARTBEAT_MS;
+    process.env.WORKER_HEARTBEAT_MS = '25';
+
+    try {
+      await service.onApplicationBootstrap();
+
+      expect(publishPending).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(25);
+
+      expect(publishPending).toHaveBeenCalledTimes(2);
+    } finally {
+      service.onModuleDestroy();
+      process.env.WORKER_HEARTBEAT_MS = previousHeartbeat;
+      jest.useRealTimers();
+    }
+  });
+});
+
 describe('billing consumer', () => {
   function createPrismaStub(orderStatus: string = 'PENDING_ERP') {
     const orders = new Map<string, any>([
@@ -360,5 +389,55 @@ describe('billing consumer', () => {
       attemptNumber: 4,
       status: 'DLQ'
     });
+  });
+});
+
+describe('order worker runner', () => {
+  it('subscribes to the billing queue and acks processed messages', async () => {
+    const consumeJson = jest.fn().mockResolvedValue(undefined);
+    const rabbit = {
+      ensureTopology: jest.fn().mockResolvedValue(undefined),
+      consumeJson
+    };
+    const billingConsumer = {
+      processWithRetry: jest.fn().mockResolvedValue(undefined)
+    };
+    const service = new (OrderWorkerRunnerService as any)(rabbit, billingConsumer);
+
+    try {
+      await service.onApplicationBootstrap();
+
+      expect(rabbit.ensureTopology).toHaveBeenCalledTimes(1);
+      expect(consumeJson).toHaveBeenCalledWith(
+        'orders.billing.q',
+        expect.any(Function)
+      );
+
+      const handler = consumeJson.mock.calls[0][1] as (
+        payload: any,
+        controls: { ack: () => void; nack: () => void }
+      ) => Promise<void>;
+      const ack = jest.fn();
+      const nack = jest.fn();
+
+      await handler(
+        {
+          orderId: 'order-1',
+          customerId: 'customer-1',
+          idempotencyKey: 'idem-1'
+        },
+        { ack, nack }
+      );
+
+      expect(billingConsumer.processWithRetry).toHaveBeenCalledWith({
+        orderId: 'order-1',
+        customerId: 'customer-1',
+        idempotencyKey: 'idem-1'
+      });
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(nack).not.toHaveBeenCalled();
+    } finally {
+      service.onModuleDestroy();
+    }
   });
 });

@@ -7,6 +7,11 @@ type PublishOptions = {
   headers?: Record<string, string>;
 };
 
+type ConsumeControls = {
+  ack: () => void;
+  nack: (requeue?: boolean) => void;
+};
+
 @Injectable()
 export class RabbitService implements OnModuleDestroy {
   private connection?: any;
@@ -68,6 +73,47 @@ export class RabbitService implements OnModuleDestroy {
       persistent: true,
       ...options
     });
+  }
+
+  async consumeJson<T>(
+    queue: string,
+    handler: (message: T, controls: ConsumeControls) => Promise<void> | void
+  ) {
+    const channel = await this.getChannel();
+
+    return channel.consume(
+      queue,
+      async (rawMessage: {
+        content: Buffer;
+        fields: Record<string, unknown>;
+        properties: Record<string, unknown>;
+      } | null) => {
+        if (!rawMessage) {
+          return;
+        }
+
+        const controls: ConsumeControls = {
+          ack: () => channel.ack(rawMessage),
+          nack: (requeue = true) => channel.nack(rawMessage, false, requeue)
+        };
+
+        let message: T;
+
+        try {
+          message = JSON.parse(rawMessage.content.toString('utf8')) as T;
+        } catch (error) {
+          controls.ack();
+          return;
+        }
+
+        try {
+          await handler(message, controls);
+        } catch (error) {
+          controls.nack(true);
+        }
+      },
+      { noAck: false }
+    );
   }
 
   private async getChannel() {

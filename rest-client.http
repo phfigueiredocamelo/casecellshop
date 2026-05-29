@@ -1,5 +1,99 @@
-# API health check
-# http://localhost:3000/health
+@apiBaseUrl = http://localhost:3000
+@erpBaseUrl = http://localhost:3001
+@customerId = customer-manual-1
+@idempotencyKey = checkout-manual-1
+@productId = prod_case_iphone_15_clear
+@orderId = replace-with-order-id-from-checkout
 
-# Fake ERP health check
-http://localhost:3001/health
+### API health check
+GET {{apiBaseUrl}}/health
+
+### Fake ERP health check
+GET {{erpBaseUrl}}/health
+
+### Fake ERP catalog
+GET {{erpBaseUrl}}/erp/products
+
+### Sync fake ERP catalog into the API database
+POST {{apiBaseUrl}}/admin/sync/erp
+
+### List products
+GET {{apiBaseUrl}}/products
+
+### List products by compatible device
+GET {{apiBaseUrl}}/products?device=apple-iphone-15&sort=price_asc&page=1&pageSize=24
+
+### Get product by id
+GET {{apiBaseUrl}}/products/{{productId}}
+
+### Checkout happy path
+POST {{apiBaseUrl}}/checkout
+Content-Type: application/json
+X-Customer-Id: {{customerId}}
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "items": [
+    {
+      "productId": "{{productId}}",
+      "quantity": 1
+    }
+  ]
+}
+
+### Replay checkout with the same idempotency key and same payload
+POST {{apiBaseUrl}}/checkout
+Content-Type: application/json
+X-Customer-Id: {{customerId}}
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "items": [
+    {
+      "productId": "{{productId}}",
+      "quantity": 1
+    }
+  ]
+}
+
+### Reuse idempotency key with a different payload, expected 409
+POST {{apiBaseUrl}}/checkout
+Content-Type: application/json
+X-Customer-Id: {{customerId}}
+Idempotency-Key: {{idempotencyKey}}
+
+{
+  "items": [
+    {
+      "productId": "{{productId}}",
+      "quantity": 2
+    }
+  ]
+}
+
+### Missing customer header, expected 400
+POST {{apiBaseUrl}}/checkout
+Content-Type: application/json
+Idempotency-Key: missing-customer
+
+{
+  "items": [
+    {
+      "productId": "{{productId}}",
+      "quantity": 1
+    }
+  ]
+}
+
+### Get order by id
+GET {{apiBaseUrl}}/orders/{{orderId}}
+
+### Get idempotency entry by key
+GET {{apiBaseUrl}}/orders/by-idempotency-key/{{idempotencyKey}}
+X-Customer-Id: {{customerId}}
+
+### Trigger order reconciliation
+POST {{apiBaseUrl}}/admin/reconcile
+
+### Get fake ERP billing status for an order
+GET {{erpBaseUrl}}/erp/billing/{{orderId}}
