@@ -40,6 +40,9 @@ interface PricedItem {
 
 @Injectable()
 export class CheckoutService {
+  private readonly checkoutRetryAttempts = 4;
+  private readonly checkoutRetryBaseDelayMs = 25;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly productsService: ProductsService
@@ -64,163 +67,167 @@ export class CheckoutService {
     const requestHash = this.hashRequest(normalizedBody);
     const cacheKeysToInvalidate = normalizedBody.items.map((item) => item.productId);
     const idempotencyLockKey = `${customerId}:${idempotencyKey}`;
+    const inventoryLockKeys = [...new Set(normalizedBody.items.map((item) => item.productId))].sort();
 
-    const result = await this.prisma.$transaction(
-      async (tx) => {
-        await this.acquireIdempotencyLock(tx, idempotencyLockKey);
+    const result = await this.runCheckoutTransactionWithRetry(() =>
+      this.prisma.$transaction(
+        async (tx) => {
+          await this.acquireIdempotencyLock(tx, idempotencyLockKey);
+          await this.acquireInventoryLocks(tx, inventoryLockKeys);
 
-        const existing = await tx.idempotencyKey.findUnique({
-          where: {
-            customerId_key: {
-              customerId,
-              key: idempotencyKey
-            }
-          }
-        });
-
-        if (existing && existing.requestHash !== requestHash) {
-          throw new ConflictException('Idempotency key reused with different payload');
-        }
-
-        if (existing?.status === IdempotencyStatus.COMPLETED && existing.responseBody) {
-          return {
-            httpStatus: 200,
-            body: existing.responseBody as unknown as CheckoutAcceptedResponse
-          };
-        }
-
-        if (existing?.status === IdempotencyStatus.PROCESSING) {
-          throw new ConflictException('Checkout already in progress for this idempotency key');
-        }
-
-        const products = await tx.product.findMany({
-          where: {
-            id: {
-              in: normalizedBody.items.map((item) => item.productId)
-            },
-            active: true
-          },
-          include: {
-            price: true
-          }
-        });
-
-        if (products.length !== normalizedBody.items.length) {
-          throw new UnprocessableEntityException('One or more products are unavailable');
-        }
-
-        const pricedItems: PricedItem[] = normalizedBody.items.map((item) => {
-          const product = products.find((candidate) => candidate.id === item.productId);
-
-          if (!product?.price) {
-            throw new UnprocessableEntityException(`Product ${item.productId} has no price`);
-          }
-
-          return {
-            productId: product.id,
-            sku: product.sku,
-            productName: product.name,
-            quantity: item.quantity,
-            unitPriceCents: product.price.priceCents
-          };
-        });
-
-        for (const item of normalizedBody.items) {
-          const updated = await tx.inventory.updateMany({
+          const existing = await tx.idempotencyKey.findUnique({
             where: {
-              productId: item.productId,
-              availableQty: {
-                gte: item.quantity
-              }
-            },
-            data: {
-              availableQty: {
-                decrement: item.quantity
-              },
-              reservedQty: {
-                increment: item.quantity
-              },
-              version: {
-                increment: 1
+              customerId_key: {
+                customerId,
+                key: idempotencyKey
               }
             }
           });
 
-          if (updated.count !== 1) {
-            throw new UnprocessableEntityException('Insufficient stock');
+          if (existing && existing.requestHash !== requestHash) {
+            throw new ConflictException('Idempotency key reused with different payload');
           }
-        }
 
-        const totalCents = pricedItems.reduce(
-          (sum, item) => sum + item.quantity * item.unitPriceCents,
-          0
-        );
+          if (existing?.status === IdempotencyStatus.COMPLETED && existing.responseBody) {
+            return {
+              httpStatus: 200,
+              body: existing.responseBody as unknown as CheckoutAcceptedResponse
+            };
+          }
 
-        const order = await tx.order.create({
-          data: {
-            customerId,
-            idempotencyKey,
-            status: OrderStatus.PENDING_ERP,
-            totalCents,
-            currency: 'BRL',
-            items: {
-              create: pricedItems.map((item) => ({
-                productId: item.productId,
-                sku: item.sku,
-                productName: item.productName,
-                quantity: item.quantity,
-                unitPriceCents: item.unitPriceCents
-              }))
+          if (existing?.status === IdempotencyStatus.PROCESSING) {
+            throw new ConflictException('Checkout already in progress for this idempotency key');
+          }
+
+          const products = await tx.product.findMany({
+            where: {
+              id: {
+                in: normalizedBody.items.map((item) => item.productId)
+              },
+              active: true
+            },
+            include: {
+              price: true
             }
-          },
-          include: {
-            items: true
+          });
+
+          if (products.length !== normalizedBody.items.length) {
+            throw new UnprocessableEntityException('One or more products are unavailable');
           }
-        });
 
-        const responseBody: CheckoutAcceptedResponse = {
-          orderId: order.id,
-          status: order.status,
-          totalCents: order.totalCents,
-          currency: order.currency
-        };
+          const pricedItems: PricedItem[] = normalizedBody.items.map((item) => {
+            const product = products.find((candidate) => candidate.id === item.productId);
 
-        await tx.outboxEvent.create({
-          data: {
-            aggregateType: 'Order',
-            aggregateId: order.id,
-            eventType: 'OrderAccepted',
-            payload: {
-              orderId: order.id,
+            if (!product?.price) {
+              throw new UnprocessableEntityException(`Product ${item.productId} has no price`);
+            }
+
+            return {
+              productId: product.id,
+              sku: product.sku,
+              productName: product.name,
+              quantity: item.quantity,
+              unitPriceCents: product.price.priceCents
+            };
+          });
+
+          for (const item of normalizedBody.items) {
+            const updated = await tx.inventory.updateMany({
+              where: {
+                productId: item.productId,
+                availableQty: {
+                  gte: item.quantity
+                }
+              },
+              data: {
+                availableQty: {
+                  decrement: item.quantity
+                },
+                reservedQty: {
+                  increment: item.quantity
+                },
+                version: {
+                  increment: 1
+                }
+              }
+            });
+
+            if (updated.count !== 1) {
+              throw new UnprocessableEntityException('Insufficient stock');
+            }
+          }
+
+          const totalCents = pricedItems.reduce(
+            (sum, item) => sum + item.quantity * item.unitPriceCents,
+            0
+          );
+
+          const order = await tx.order.create({
+            data: {
               customerId,
               idempotencyKey,
-              totalCents: order.totalCents,
-              currency: order.currency
+              status: OrderStatus.PENDING_ERP,
+              totalCents,
+              currency: 'BRL',
+              items: {
+                create: pricedItems.map((item) => ({
+                  productId: item.productId,
+                  sku: item.sku,
+                  productName: item.productName,
+                  quantity: item.quantity,
+                  unitPriceCents: item.unitPriceCents
+                }))
+              }
             },
-            status: 'PENDING',
-            orderId: order.id
-          }
-        });
+            include: {
+              items: true
+            }
+          });
 
-        await tx.idempotencyKey.create({
-          data: {
-            customerId,
-            key: idempotencyKey,
-            requestHash,
+          const responseBody: CheckoutAcceptedResponse = {
             orderId: order.id,
-            status: IdempotencyStatus.COMPLETED,
-            responseBody: responseBody as unknown as Prisma.InputJsonValue
-          }
-        });
+            status: order.status,
+            totalCents: order.totalCents,
+            currency: order.currency
+          };
 
-        return {
-          httpStatus: 202,
-          body: responseBody
-        };
-      },
-      {
-        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
-      }
+          await tx.outboxEvent.create({
+            data: {
+              aggregateType: 'Order',
+              aggregateId: order.id,
+              eventType: 'OrderAccepted',
+              payload: {
+                orderId: order.id,
+                customerId,
+                idempotencyKey,
+                totalCents: order.totalCents,
+                currency: order.currency
+              },
+              status: 'PENDING',
+              orderId: order.id
+            }
+          });
+
+          await tx.idempotencyKey.create({
+            data: {
+              customerId,
+              key: idempotencyKey,
+              requestHash,
+              orderId: order.id,
+              status: IdempotencyStatus.COMPLETED,
+              responseBody: responseBody as unknown as Prisma.InputJsonValue
+            }
+          });
+
+          return {
+            httpStatus: 202,
+            body: responseBody
+          };
+        },
+        {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        }
+      )
     );
 
     await this.productsService.invalidateAvailability(cacheKeysToInvalidate);
@@ -255,7 +262,50 @@ export class CheckoutService {
     return createHash('sha256').update(JSON.stringify(body)).digest('hex');
   }
 
+  private async runCheckoutTransactionWithRetry<T>(operation: () => Promise<T>): Promise<T> {
+    let attempt = 0;
+
+    while (true) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (!this.isRetryableTransactionError(error) || attempt >= this.checkoutRetryAttempts - 1) {
+          throw error;
+        }
+
+        const delayMs = this.checkoutRetryBaseDelayMs * 2 ** attempt;
+        attempt += 1;
+        await this.delay(delayMs);
+      }
+    }
+  }
+
+  private isRetryableTransactionError(error: unknown) {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: string }).code === 'P2034'
+    );
+  }
+
+  private async delay(ms: number) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
   private async acquireIdempotencyLock(tx: Prisma.TransactionClient, lockKey: string) {
+    await this.acquireAdvisoryLock(tx, lockKey);
+  }
+
+  private async acquireInventoryLocks(tx: Prisma.TransactionClient, productIds: string[]) {
+    for (const productId of productIds) {
+      await this.acquireAdvisoryLock(tx, `inventory:${productId}`);
+    }
+  }
+
+  private async acquireAdvisoryLock(tx: Prisma.TransactionClient, lockKey: string) {
     if (typeof (tx as Prisma.TransactionClient & { $executeRaw?: unknown }).$executeRaw !== 'function') {
       return;
     }

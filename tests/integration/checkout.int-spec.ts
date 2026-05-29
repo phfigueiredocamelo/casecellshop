@@ -2,13 +2,18 @@ import { CheckoutService } from '../../apps/api/src/checkout/checkout.service';
 import { CheckoutController } from '../../apps/api/src/checkout/checkout.controller';
 
 describe('checkout', () => {
-  function createPrismaStub() {
+  function createPrismaStub(
+    options: { inventoryUpdateFailures?: number; captureLocks?: boolean } = {}
+  ) {
     const state = {
       idempotencyByKey: new Map<string, any>(),
       orders: new Map<string, any>(),
       inventories: new Map<string, any>(),
       products: new Map<string, any>(),
-      outbox: [] as any[]
+      outbox: [] as any[],
+      locks: [] as string[],
+      transactionCalls: 0,
+      inventoryUpdateFailures: options.inventoryUpdateFailures ?? 0
     };
 
     state.products.set('prod-1', {
@@ -39,6 +44,12 @@ describe('checkout', () => {
     });
 
     const txFactory = async (callback: (tx: any) => Promise<any>) => callback({
+      $executeRaw: options.captureLocks
+        ? async (_query: TemplateStringsArray, ...values: unknown[]) => {
+            state.locks.push(String(values[0]));
+            return undefined;
+          }
+        : undefined,
       idempotencyKey: {
         async findUnique({ where }: any) {
           const key = `${where.customerId_key.customerId}:${where.customerId_key.key}`;
@@ -63,6 +74,13 @@ describe('checkout', () => {
       },
       inventory: {
         async updateMany({ where, data }: any) {
+          if (state.inventoryUpdateFailures > 0) {
+            state.inventoryUpdateFailures -= 1;
+            const error = new Error('Transaction failed due to a write conflict or a deadlock');
+            (error as Error & { code?: string }).code = 'P2034';
+            throw error;
+          }
+
           const inventory = state.inventories.get(where.productId);
           if (!inventory || inventory.availableQty < where.availableQty.gte) {
             return { count: 0 };
@@ -100,7 +118,10 @@ describe('checkout', () => {
     return {
       state,
       prisma: {
-        $transaction: txFactory,
+        $transaction: async (...args: Parameters<typeof txFactory>) => {
+          state.transactionCalls += 1;
+          return txFactory(...args);
+        },
         idempotencyKey: {
           findUnique: async ({ where }: any) => {
             const key = `${where.customerId_key.customerId}:${where.customerId_key.key}`;
@@ -188,5 +209,43 @@ describe('checkout', () => {
         items: [{ productId: 'prod-1', quantity: 2 }]
       })
     ).rejects.toThrow('Idempotency key reused with different payload');
+  });
+
+  it('retries transient inventory write conflicts and still accepts the checkout', async () => {
+    const { prisma, state } = createPrismaStub({ inventoryUpdateFailures: 1 });
+    const productsService = {
+      invalidateAvailability: jest.fn().mockResolvedValue(undefined)
+    };
+    const service = new CheckoutService(prisma as any, productsService as any);
+
+    const result = await service.checkout('customer-1', 'idem-1', {
+      items: [{ productId: 'prod-1', quantity: 1 }]
+    });
+
+    expect(result.httpStatus).toBe(202);
+    expect(state.transactionCalls).toBeGreaterThan(1);
+    expect(state.orders.size).toBe(1);
+  });
+
+  it('acquires advisory locks in a stable order before mutating inventory', async () => {
+    const { prisma, state } = createPrismaStub({ captureLocks: true });
+    const productsService = {
+      invalidateAvailability: jest.fn().mockResolvedValue(undefined)
+    };
+    const service = new CheckoutService(prisma as any, productsService as any);
+
+    const result = await service.checkout('customer-1', 'idem-1', {
+      items: [
+        { productId: 'prod-hot', quantity: 1 },
+        { productId: 'prod-1', quantity: 1 }
+      ]
+    });
+
+    expect(result.httpStatus).toBe(202);
+    expect(state.locks).toEqual([
+      'customer-1:idem-1',
+      'inventory:prod-1',
+      'inventory:prod-hot'
+    ]);
   });
 });

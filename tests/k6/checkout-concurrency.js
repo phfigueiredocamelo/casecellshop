@@ -1,5 +1,6 @@
 import http from 'k6/http';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
+import { BASE_URL, DEMO_PRODUCTS, jsonHeaders, uniqueId } from './helpers.js';
 
 export const options = {
   vus: 10,
@@ -10,23 +11,27 @@ export const options = {
 };
 
 export default function () {
-  const baseUrl = __ENV.BASE_URL || 'http://localhost:3000';
-  const customerId = `customer-${Math.random().toString(36).slice(2, 10)}`;
-  const response = http.post(
-    `${baseUrl}/checkout`,
-    JSON.stringify({
-      items: [{ productId: 'prod-hot', quantity: 1 }]
+  const customerId = uniqueId('customer-checkout');
+  const idempotencyKey = uniqueId('checkout-key');
+  const requestOptions = {
+    ...jsonHeaders({
+      'X-Customer-Id': customerId,
+      'Idempotency-Key': idempotencyKey
     }),
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Customer-Id': customerId,
-        'Idempotency-Key': `${customerId}-${__ITER}`
-      }
-    }
+    responseCallback: http.expectedStatuses(202, 409, 422)
+  };
+  const response = http.post(
+    `${BASE_URL}/checkout`,
+    JSON.stringify({
+      items: [{ productId: DEMO_PRODUCTS.iphone15Clear, quantity: 1 }]
+    }),
+    requestOptions
   );
 
   check(response, {
-    'status is accepted or conflict': (r) => r.status === 202 || r.status === 409
+    'checkout returns expected status': (r) => [202, 409, 422].includes(r.status),
+    'checkout does not return 5xx': (r) => r.status < 500
   });
+
+  sleep(0.1);
 }
