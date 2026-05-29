@@ -27,6 +27,25 @@ export class MetricsService {
     collectDefaultMetrics({ register: this.registry });
   }
 
+  recordHttpRequest(input: {
+    route: string;
+    method: string;
+    status: number;
+    durationSeconds: number;
+  }) {
+    this.httpRequestDurationSeconds
+      .labels(input.route, input.method, String(input.status))
+      .observe(input.durationSeconds);
+  }
+
+  recordCacheHit(cache: string) {
+    this.cacheHitsTotal.labels(cache).inc();
+  }
+
+  recordCacheMiss(cache: string) {
+    this.cacheMissesTotal.labels(cache).inc();
+  }
+
   async getMetrics() {
     return this.registry.metrics();
   }

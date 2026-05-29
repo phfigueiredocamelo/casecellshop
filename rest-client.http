@@ -1,9 +1,12 @@
 @apiBaseUrl = http://localhost:3000
 @erpBaseUrl = http://localhost:3001
 @customerId = customer-manual-1
-@idempotencyKey = checkout-manual-1
+@idempotencyKey = checkout-manual-2
 @productId = prod_case_iphone_15_clear
-@orderId = replace-with-order-id-from-checkout
+@orderId = cmprh2y9d0005rvj586rptspw
+
+### API metrics
+GET {{apiBaseUrl}}/metrics
 
 ### API health check
 GET {{apiBaseUrl}}/health

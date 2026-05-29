@@ -1,6 +1,9 @@
 import { Test } from '@nestjs/testing';
+import { lastValueFrom, of } from 'rxjs';
 import { AppModule } from '../../apps/api/src/app.module';
 import { HealthController } from '../../apps/api/src/health.controller';
+import { HttpMetricsInterceptor } from '../../libs/observability/src/http-metrics.interceptor';
+import { MetricsService } from '../../libs/observability/src/metrics.service';
 import { ProductsService } from '../../apps/api/src/products/products.service';
 import { CacheService } from '../../libs/cache/src/cache.service';
 import { PrismaService } from '../../libs/db/src/prisma.service';
@@ -37,9 +40,32 @@ describe('api observability foundation', () => {
       status: 'ok'
     });
 
+    await lastValueFrom(
+      app.get(HttpMetricsInterceptor).intercept(
+        {
+          getType: () => 'http',
+          switchToHttp: () => ({
+            getRequest: () => ({
+              method: 'GET',
+              originalUrl: '/health',
+              route: { path: '/health' }
+            }),
+            getResponse: () => ({ statusCode: 200 })
+          })
+        } as any,
+        { handle: () => of({ status: 'ok' }) } as any
+      )
+    );
+
     const metricsResponse = await app.get(MetricsController).getMetrics();
+
     expect(metricsResponse).toContain('http_request_duration_seconds');
+    expect(metricsResponse).toContain('route="/health",method="GET",status="200"');
     expect(metricsResponse).toContain('cache_hits_total');
+
+    app.get(MetricsService).recordCacheHit('products');
+    const updatedMetricsResponse = await app.get(MetricsController).getMetrics();
+    expect(updatedMetricsResponse).toContain('cache_hits_total{cache="products"} 1');
 
     await app.close();
   });

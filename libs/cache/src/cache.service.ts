@@ -1,6 +1,7 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, Optional } from '@nestjs/common';
 import Redis from 'ioredis';
 import { env } from '../../config/src';
+import { MetricsService } from '../../observability/src';
 
 @Injectable()
 export class CacheService implements OnModuleDestroy {
@@ -8,6 +9,8 @@ export class CacheService implements OnModuleDestroy {
     lazyConnect: true,
     maxRetriesPerRequest: 1
   });
+
+  constructor(@Optional() private readonly metricsService?: MetricsService) {}
 
   async onModuleDestroy() {
     if (this.redis.status !== 'end') {
@@ -19,7 +22,15 @@ export class CacheService implements OnModuleDestroy {
     await this.ensureConnected();
     const value = await this.redis.get(key);
 
-    return value ? (JSON.parse(value) as T) : null;
+    if (!value) {
+      this.metricsService?.recordCacheMiss(this.getCacheNamespace(key));
+
+      return null;
+    }
+
+    this.metricsService?.recordCacheHit(this.getCacheNamespace(key));
+
+    return JSON.parse(value) as T;
   }
 
   async setJson(key: string, value: unknown, ttlSeconds: number) {
@@ -48,5 +59,9 @@ export class CacheService implements OnModuleDestroy {
     if (this.redis.status === 'wait') {
       await this.redis.connect();
     }
+  }
+
+  private getCacheNamespace(key: string) {
+    return key.split(':')[0] || 'unknown';
   }
 }
