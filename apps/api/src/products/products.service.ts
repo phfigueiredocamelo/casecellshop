@@ -114,7 +114,6 @@ export class ProductsService {
 
     await Promise.all(
       productIds.flatMap((productId) => [
-        this.cache.delete(`product:availability:${productId}`).catch(() => undefined),
         this.cache.delete(`product:card:v${catalogVersion}:${productId}`).catch(() => undefined)
       ])
     );

@@ -268,9 +268,7 @@ describe('api observability foundation', () => {
 
     await service.invalidateAvailability(['prod-1', 'prod-2']);
 
-    expect(deleteSpy).toHaveBeenCalledWith('product:availability:prod-1');
     expect(deleteSpy).toHaveBeenCalledWith('product:card:v9:prod-1');
-    expect(deleteSpy).toHaveBeenCalledWith('product:availability:prod-2');
     expect(deleteSpy).toHaveBeenCalledWith('product:card:v9:prod-2');
   });
 });

@@ -244,7 +244,6 @@ Chaves Redis derivadas:
 ```text
 products:query:v42:brand=*:device=iphone-15:sort=price_asc:page=1:size=24
 product:card:v42:{productId}
-product:availability:{productId}
 ```
 
 A chave `products:query` armazena IDs ordenados e metadados de paginacao. O card do produto armazena dados menos volateis como nome, SKU, imagem e preco. A disponibilidade fica separada por produto, com TTL menor.
@@ -256,8 +255,6 @@ TTLs sugeridos:
 ```text
 products:query:v{version}:...  60s a 120s, com stale por 5min a 10min
 product:card:v{version}:{id}   5min
-product:detail:v{version}:{id} 5min
-product:availability:{id}      15s a 30s
 ```
 
 Refresh-ahead pode ser demonstrado por job simples para produtos mais acessados, medidos por contadores Redis como `product:views:{id}`.
@@ -509,7 +506,7 @@ Testes de integracao:
 - `sort=price_asc` e `sort=price_desc` ordenam pelo preco atual.
 - `sort=relevance` ordena por `popularityScore` e recencia.
 - parametros em ordem diferente geram a mesma chave canonica de cache.
-- checkout invalida `product:availability:{id}` sem invalidar todas as queries de listagem.
+- checkout invalida `product:card:v{catalogVersion}:{productId}` sem invalidar todas as queries de listagem.
 - sync ERP que altera preco, produto, status ou compatibilidade incrementa `catalog_versions`.
 - cache stampede em query quente gera uma unica recomposicao principal e concorrentes usam releitura ou stale cache.
 - Redis indisponivel nao derruba leitura da vitrine.

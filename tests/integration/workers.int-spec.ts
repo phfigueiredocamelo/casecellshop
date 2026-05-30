@@ -119,7 +119,6 @@ describe('reconciliation worker catalog sync', () => {
         active: false
       }
     });
-    expect(cacheDelete).toHaveBeenCalledWith('product:availability:prod-a');
   });
 });
 

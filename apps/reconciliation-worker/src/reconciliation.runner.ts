@@ -147,12 +147,6 @@ export class ReconciliationRunner {
       }
     });
 
-    await Promise.all(
-      activeIds.map((productId) =>
-        this.cache.delete(`product:availability:${productId}`).catch(() => undefined)
-      )
-    );
-
     return {
       synced: erpProducts.length,
       catalogVersion: catalogVersion.version
