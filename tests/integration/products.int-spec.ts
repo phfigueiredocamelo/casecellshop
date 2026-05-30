@@ -268,6 +268,55 @@ describe('api observability foundation', () => {
     expect(recordProductCardHydrationMiss).toHaveBeenCalledWith(1);
   });
 
+  it('waits briefly for a query lock and returns empty when contention persists', async () => {
+    const findMany = jest.fn();
+    const acquireLock = jest.fn().mockResolvedValue(false);
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout').mockImplementation((callback: any) => {
+      if (typeof callback === 'function') {
+        callback();
+      }
+
+      return 0 as any;
+    });
+    const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0);
+    const service = new ProductsService(
+      {
+        catalogVersion: {
+          findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 15 })
+        },
+        product: {
+          findMany
+        }
+      } as any,
+      {
+        getJson: jest.fn().mockResolvedValue(null),
+        setJson: jest.fn().mockResolvedValue(undefined),
+        acquireLock,
+        releaseLock: jest.fn().mockResolvedValue(undefined)
+      } as any
+    );
+
+    try {
+      const response = await service.listProducts({
+        device: 'apple-iphone-15'
+      });
+
+      expect(acquireLock).toHaveBeenCalledTimes(2);
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 25);
+      expect(findMany).not.toHaveBeenCalled();
+      expect(response.items).toEqual([]);
+      expect(response.meta).toEqual(
+        expect.objectContaining({
+          cache: 'miss-locked',
+          retryLater: true
+        })
+      );
+    } finally {
+      setTimeoutSpy.mockRestore();
+      randomSpy.mockRestore();
+    }
+  });
+
   it('warms product card caches when populating a product query cache miss', async () => {
     const setJson = jest.fn().mockResolvedValue(undefined);
     const service = new ProductsService(

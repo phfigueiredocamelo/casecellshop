@@ -69,7 +69,19 @@ export class ProductsService {
     }
 
     const lockKey = `lock:${queryKey}`;
-    const hasLock = await this.cache.acquireLock(lockKey, 5).catch(() => false);
+    const hasLock = await this.acquireQueryLockWithRetry(lockKey);
+
+    if (!hasLock) {
+      return {
+        items: [],
+        meta: {
+          ...normalized,
+          catalogVersion,
+          cache: 'miss-locked',
+          retryLater: true
+        }
+      };
+    }
 
     try {
       const items = await this.fetchProducts(normalized);
@@ -328,6 +340,24 @@ export class ProductsService {
   }
 
   private getHydrationRetryJitterMs() {
+    return 25 + Math.floor(Math.random() * 50);
+  }
+
+  private async acquireQueryLockWithRetry(lockKey: string) {
+    if (await this.tryAcquireQueryLock(lockKey)) {
+      return true;
+    }
+
+    await this.sleep(this.getQueryRetryJitterMs());
+
+    return this.tryAcquireQueryLock(lockKey);
+  }
+
+  private async tryAcquireQueryLock(lockKey: string) {
+    return this.cache.acquireLock(lockKey, 5).catch(() => false);
+  }
+
+  private getQueryRetryJitterMs() {
     return 25 + Math.floor(Math.random() * 50);
   }
 
