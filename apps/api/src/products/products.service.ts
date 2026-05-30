@@ -39,7 +39,7 @@ export class ProductsService {
     const cachedIds = await this.cache.getJson<ProductQueryCacheEntry>(queryKey).catch(() => null);
 
     if (cachedIds) {
-      const items = await this.hydrateProducts(cachedIds);
+      const items = await this.hydrateProducts(catalogVersion, cachedIds);
 
       return {
         items,
@@ -198,10 +198,52 @@ export class ProductsService {
     }));
   }
 
-  private async hydrateProducts(ids: string[]) {
-    const products = await Promise.all(ids.map((id) => this.getProductById(id)));
+  private async hydrateProducts(catalogVersion: number, ids: string[]) {
+    if (ids.length === 0) {
+      return [];
+    }
 
-    return products.filter((product): product is ProductListItem => product !== null);
+    const cacheKeys = ids.map((id) => `product:card:v${catalogVersion}:${id}`);
+    const cachedProducts = await this.cache
+      .getJsonMany<ProductListItem>(cacheKeys)
+      .catch(() => ids.map(() => null));
+    const productsById = new Map<string, ProductListItem>();
+    const missingIds: string[] = [];
+
+    ids.forEach((id, index) => {
+      const cachedProduct = cachedProducts[index];
+
+      if (cachedProduct) {
+        productsById.set(id, cachedProduct);
+      } else {
+        missingIds.push(id);
+      }
+    });
+
+    if (missingIds.length > 0) {
+      const fetchedProducts = await this.fetchProducts(
+        {
+          brand: '',
+          device: '',
+          page: 1,
+          pageSize: missingIds.length,
+          sort: 'relevance'
+        },
+        { id: { in: missingIds } }
+      );
+
+      await Promise.all(
+        fetchedProducts.map((product) => {
+          productsById.set(product.id, product);
+
+          return this.cacheProductCard(catalogVersion, product);
+        })
+      );
+    }
+
+    return ids
+      .map((id) => productsById.get(id) ?? null)
+      .filter((product): product is ProductListItem => product !== null);
   }
 
   private async cacheProductCard(catalogVersion: number, product: ProductListItem) {

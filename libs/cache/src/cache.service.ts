@@ -33,6 +33,23 @@ export class CacheService implements OnModuleDestroy {
     return JSON.parse(value) as T;
   }
 
+  async getJsonMany<T>(keys: string[]): Promise<Array<T | null>> {
+    if (keys.length === 0) {
+      return [];
+    }
+
+    await this.ensureConnected();
+    const values = await this.redis.mget(keys);
+
+    return values.map((value, index) => {
+      this.metricsService?.[value ? 'recordCacheHit' : 'recordCacheMiss'](
+        this.getCacheNamespace(keys[index])
+      );
+
+      return value ? (JSON.parse(value) as T) : null;
+    });
+  }
+
   async setJson(key: string, value: unknown, ttlSeconds: number) {
     await this.ensureConnected();
     await this.redis.set(key, JSON.stringify(value), 'EX', ttlSeconds);

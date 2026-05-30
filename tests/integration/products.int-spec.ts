@@ -143,47 +143,65 @@ describe('api observability foundation', () => {
     ]);
   });
 
-  it('hydrates cached product ids through fresh product lookups', async () => {
+  it('hydrates cached product ids with a single batched product lookup', async () => {
+    const findMany = jest.fn().mockResolvedValue([
+      {
+        id: 'prod-2',
+        sku: 'SKU-2',
+        name: 'Capa Galaxy S24',
+        imageUrl: null,
+        brand: 'CaseCell',
+        price: { priceCents: 6990, currency: 'BRL' },
+        inventory: { availableQty: 3 }
+      },
+      {
+        id: 'prod-1',
+        sku: 'SKU-1',
+        name: 'Capa iPhone 15',
+        imageUrl: null,
+        brand: 'CaseCell',
+        price: { priceCents: 5990, currency: 'BRL' },
+        inventory: { availableQty: 7 }
+      }
+    ]);
+    const getJson = jest
+      .fn()
+      .mockResolvedValueOnce(['prod-1', 'prod-2'])
+      .mockResolvedValue(null);
+    const getJsonMany = jest.fn().mockResolvedValue([null, null]);
     const service = new ProductsService(
       {
         catalogVersion: {
           findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 11 })
         },
         product: {
-          findMany: jest.fn()
+          findMany
         }
       } as any,
       {
-        getJson: jest.fn().mockResolvedValue(['prod-1']),
+        getJson,
+        getJsonMany,
         setJson: jest.fn().mockResolvedValue(undefined),
         acquireLock: jest.fn().mockResolvedValue(false),
         releaseLock: jest.fn().mockResolvedValue(undefined)
       } as any
     );
 
-    jest.spyOn(service, 'getProductById').mockResolvedValue({
-      id: 'prod-1',
-      sku: 'SKU-1',
-      name: 'Capa iPhone 15',
-      imageUrl: null,
-      brand: 'CaseCell',
-      priceCents: 5990,
-      currency: 'BRL',
-      availableQty: 7,
-      inStock: true
-    });
-
     const response = await service.listProducts({
       device: 'apple-iphone-15'
     });
 
-    expect(service.getProductById).toHaveBeenCalledWith('prod-1');
-    expect(response.items).toEqual([
+    expect(findMany).toHaveBeenCalledTimes(1);
+    expect(findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: 'prod-1',
-        availableQty: 7
+        where: expect.objectContaining({
+          active: true,
+          id: { in: ['prod-1', 'prod-2'] }
+        }),
+        take: 2
       })
-    ]);
+    );
+    expect(response.items.map((item) => item.id)).toEqual(['prod-1', 'prod-2']);
   });
 
   it('warms product card caches when populating a product query cache miss', async () => {
