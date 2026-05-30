@@ -1,3 +1,6 @@
+export * from './http-error.filter';
+export * from './request-context.middleware';
+export * from './request-context.service';
 export * from './logger.module';
 export * from './logger.service';
 export * from './http-metrics.interceptor';
