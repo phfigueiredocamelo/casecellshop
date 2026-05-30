@@ -258,7 +258,10 @@ export class CheckoutService {
                         customerId,
                         idempotencyKey,
                         totalCents: order.totalCents,
-                        currency: order.currency
+                        currency: order.currency,
+                        correlationId: this.requestContext?.get()?.correlationId,
+                        requestId: this.requestContext?.get()?.requestId,
+                        traceId: this.requestContext?.get()?.traceId
                       },
                       status: 'PENDING',
                       orderId: order.id
@@ -468,7 +471,10 @@ export class CheckoutService {
                       customerId,
                       idempotencyKey,
                       totalCents: order.totalCents,
-                      currency: order.currency
+                      currency: order.currency,
+                      correlationId: this.requestContext?.get()?.correlationId,
+                      requestId: this.requestContext?.get()?.requestId,
+                      traceId: this.requestContext?.get()?.traceId
                     },
                     status: 'PENDING',
                     orderId: order.id

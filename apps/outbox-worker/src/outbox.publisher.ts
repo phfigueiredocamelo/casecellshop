@@ -27,7 +27,10 @@ export class OutboxPublisher {
           headers: {
             orderId: String(payload.orderId ?? event.aggregateId),
             customerId: String(payload.customerId ?? ''),
-            idempotencyKey: String(payload.idempotencyKey ?? '')
+            idempotencyKey: String(payload.idempotencyKey ?? ''),
+            correlationId: String(payload.correlationId ?? ''),
+            requestId: String(payload.requestId ?? ''),
+            traceId: String(payload.traceId ?? '')
           }
         });
 

@@ -10,6 +10,7 @@ type PublishOptions = {
 type ConsumeControls = {
   ack: () => void;
   nack: (requeue?: boolean) => void;
+  headers: Record<string, string>;
 };
 
 @Injectable()
@@ -94,7 +95,8 @@ export class RabbitService implements OnModuleDestroy {
 
         const controls: ConsumeControls = {
           ack: () => channel.ack(rawMessage),
-          nack: (requeue = true) => channel.nack(rawMessage, false, requeue)
+          nack: (requeue = true) => channel.nack(rawMessage, false, requeue),
+          headers: ((rawMessage.properties.headers ?? {}) as Record<string, string>)
         };
 
         let message: T;

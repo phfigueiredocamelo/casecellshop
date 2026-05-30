@@ -205,7 +205,10 @@ describe('outbox publisher', () => {
         payload: {
           orderId: 'order-1',
           customerId: 'customer-1',
-          idempotencyKey: 'idem-1'
+          idempotencyKey: 'idem-1',
+          correlationId: 'corr-1',
+          requestId: 'req-1',
+          traceId: 'trace-1'
         },
         createdAt: new Date()
       }
@@ -236,10 +239,21 @@ describe('outbox publisher', () => {
       expect.objectContaining({
         orderId: 'order-1',
         customerId: 'customer-1',
-        idempotencyKey: 'idem-1'
+        idempotencyKey: 'idem-1',
+        correlationId: 'corr-1',
+        requestId: 'req-1',
+        traceId: 'trace-1'
       }),
       expect.objectContaining({
-        messageId: 'evt-1'
+        messageId: 'evt-1',
+        headers: expect.objectContaining({
+          orderId: 'order-1',
+          customerId: 'customer-1',
+          idempotencyKey: 'idem-1',
+          correlationId: 'corr-1',
+          requestId: 'req-1',
+          traceId: 'trace-1'
+        })
       })
     );
     expect(update).toHaveBeenCalledWith({
@@ -371,14 +385,30 @@ describe('billing consumer', () => {
         orderId: 'order-2',
         customerId: 'customer-1',
         idempotencyKey: 'idem-2',
-        attempt: 4
+        attempt: 4,
+        correlationId: 'corr-2',
+        requestId: 'req-2',
+        traceId: 'trace-2'
       })
     ).rejects.toThrow();
 
     expect(rabbit.publishToDlq).toHaveBeenCalledWith(
       expect.objectContaining({
         orderId: 'order-2',
-        attempt: 4
+        attempt: 4,
+        correlationId: 'corr-2',
+        requestId: 'req-2',
+        traceId: 'trace-2'
+      }),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          orderId: 'order-2',
+          customerId: 'customer-1',
+          idempotencyKey: 'idem-2',
+          correlationId: 'corr-2',
+          requestId: 'req-2',
+          traceId: 'trace-2'
+        })
       })
     );
     expect(integrationAttempts).toHaveLength(1);
@@ -414,7 +444,7 @@ describe('order worker runner', () => {
 
       const handler = consumeJson.mock.calls[0][1] as (
         payload: any,
-        controls: { ack: () => void; nack: () => void }
+        controls: { ack: () => void; nack: () => void; headers: Record<string, string> }
       ) => Promise<void>;
       const ack = jest.fn();
       const nack = jest.fn();
@@ -425,13 +455,27 @@ describe('order worker runner', () => {
           customerId: 'customer-1',
           idempotencyKey: 'idem-1'
         },
-        { ack, nack }
+        {
+          ack,
+          nack,
+          headers: {
+            orderId: 'order-1',
+            customerId: 'customer-1',
+            idempotencyKey: 'idem-1',
+            correlationId: 'corr-1',
+            requestId: 'req-1',
+            traceId: 'trace-1'
+          }
+        }
       );
 
       expect(billingConsumer.processWithRetry).toHaveBeenCalledWith({
         orderId: 'order-1',
         customerId: 'customer-1',
-        idempotencyKey: 'idem-1'
+        idempotencyKey: 'idem-1',
+        correlationId: 'corr-1',
+        requestId: 'req-1',
+        traceId: 'trace-1'
       });
       expect(ack).toHaveBeenCalledTimes(1);
       expect(nack).not.toHaveBeenCalled();

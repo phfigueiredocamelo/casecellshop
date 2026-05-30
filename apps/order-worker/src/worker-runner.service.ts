@@ -58,11 +58,21 @@ export class WorkerRunnerService
             customerId: string;
             idempotencyKey: string;
             attempt?: number;
+            correlationId?: string;
+            requestId?: string;
+            traceId?: string;
           },
-          controls: { ack: () => void }
+          controls: { ack: () => void; headers: Record<string, string> }
         ) => {
+          const headers = controls.headers ?? {};
+
           try {
-            await this.billingConsumer.processWithRetry(message);
+            await this.billingConsumer.processWithRetry({
+              ...message,
+              correlationId: message.correlationId ?? headers.correlationId,
+              requestId: message.requestId ?? headers.requestId,
+              traceId: message.traceId ?? headers.traceId
+            });
           } catch (error) {
             this.logger.error(
               `billing processing failed for ${message.orderId}`,

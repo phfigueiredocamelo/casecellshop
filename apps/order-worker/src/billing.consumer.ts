@@ -8,6 +8,9 @@ export interface BillingMessage {
   customerId: string;
   idempotencyKey: string;
   attempt?: number;
+  correlationId?: string;
+  requestId?: string;
+  traceId?: string;
 }
 
 @Injectable()
@@ -55,7 +58,7 @@ export class BillingConsumer {
           attemptNumber: currentAttempt,
           status: currentAttempt >= 4 ? 'DLQ' : 'FAILED',
           errorMessage: error instanceof Error ? error.message : String(error),
-          correlationId: message.idempotencyKey
+          correlationId: message.correlationId ?? message.idempotencyKey
         }
       });
 
@@ -72,7 +75,19 @@ export class BillingConsumer {
           orderId: message.orderId,
           idempotencyKey: message.idempotencyKey,
           customerId: message.customerId,
-          attempt: currentAttempt
+          attempt: currentAttempt,
+          correlationId: message.correlationId,
+          requestId: message.requestId,
+          traceId: message.traceId
+        }, {
+          headers: {
+            orderId: message.orderId,
+            customerId: message.customerId,
+            idempotencyKey: message.idempotencyKey,
+            correlationId: message.correlationId ?? '',
+            requestId: message.requestId ?? '',
+            traceId: message.traceId ?? ''
+          }
         });
 
         throw error;
@@ -82,7 +97,19 @@ export class BillingConsumer {
         orderId: message.orderId,
         idempotencyKey: message.idempotencyKey,
         customerId: message.customerId,
-        attempt: currentAttempt + 1
+        attempt: currentAttempt + 1,
+        correlationId: message.correlationId,
+        requestId: message.requestId,
+        traceId: message.traceId
+      }, {
+        headers: {
+          orderId: message.orderId,
+          customerId: message.customerId,
+          idempotencyKey: message.idempotencyKey,
+          correlationId: message.correlationId ?? '',
+          requestId: message.requestId ?? '',
+          traceId: message.traceId ?? ''
+        }
       });
 
       throw error;
