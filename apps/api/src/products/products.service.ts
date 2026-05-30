@@ -3,7 +3,11 @@ import { Prisma } from '@prisma/client';
 import { createHash } from 'crypto';
 import { CacheService } from '../../../../libs/cache/src';
 import { PrismaService } from '../../../../libs/db/src';
-import { MetricsService } from '../../../../libs/observability/src';
+import {
+  LoggerService,
+  MetricsService,
+  TraceService
+} from '../../../../libs/observability/src';
 
 export interface ProductQuery {
   brand?: string;
@@ -37,7 +41,9 @@ export class ProductsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cache: CacheService,
-    @Optional() private readonly metricsService?: MetricsService
+    @Optional() private readonly metricsService?: MetricsService,
+    @Optional() private readonly loggerService?: LoggerService,
+    @Optional() private readonly traceService?: TraceService
   ) {}
 
   async listProducts(query: ProductQuery) {
@@ -47,6 +53,10 @@ export class ProductsService {
     const cachedIds = await this.cache.getJson<ProductQueryCacheEntry>(queryKey).catch(() => null);
 
     if (cachedIds) {
+      this.loggerService?.info(
+        { operation: 'products.cache_hit', cache: 'products_query', queryKey },
+        'products cache hit'
+      );
       const hydrated = await this.hydrateProducts(catalogVersion, cachedIds);
       const meta = {
         ...normalized,
@@ -72,6 +82,10 @@ export class ProductsService {
     const hasLock = await this.acquireQueryLockWithRetry(lockKey);
 
     if (!hasLock) {
+      this.loggerService?.warn(
+        { operation: 'products.cache_miss_locked', cache: 'products_query', queryKey },
+        'products cache miss locked'
+      );
       return {
         items: [],
         meta: {
@@ -84,7 +98,13 @@ export class ProductsService {
     }
 
     try {
-      const items = await this.fetchProducts(normalized);
+      const items = await (this.traceService
+        ? this.traceService.startSpan('repo.products.fetch', () => this.fetchProducts(normalized))
+        : this.fetchProducts(normalized));
+      this.loggerService?.info(
+        { operation: 'products.cache_miss_populated', cache: 'products_query', queryKey },
+        'products cache miss populated'
+      );
 
       if (hasLock) {
         await Promise.all([
@@ -118,22 +138,46 @@ export class ProductsService {
     const cached = await this.cache.getJson<ProductListItem>(cacheKey).catch(() => null);
 
     if (cached) {
+      this.loggerService?.info(
+        { operation: 'products.card_cache_hit', cache: 'product_card', productId: id },
+        'product card cache hit'
+      );
       return cached;
     }
 
-    const [product] = await this.fetchProducts({
-      brand: '',
-      device: '',
-      page: 1,
-      pageSize: 1,
-      sort: 'relevance'
-    }, { id });
+    const [product] = await (this.traceService
+      ? this.traceService.startSpan('repo.product.fetch', () =>
+          this.fetchProducts(
+            {
+              brand: '',
+              device: '',
+              page: 1,
+              pageSize: 1,
+              sort: 'relevance'
+            },
+            { id }
+          )
+        )
+      : this.fetchProducts(
+          {
+            brand: '',
+            device: '',
+            page: 1,
+            pageSize: 1,
+            sort: 'relevance'
+          },
+          { id }
+        ));
 
     if (!product) {
       return null;
     }
 
     await this.cacheProductCard(catalogVersion, product);
+    this.loggerService?.info(
+      { operation: 'products.card_cache_miss_populated', cache: 'product_card', productId: id },
+      'product card cache miss populated'
+    );
 
     return product;
   }
@@ -266,16 +310,29 @@ export class ProductsService {
 
         this.collectCachedProducts(missingIds, rereadProducts, productsById);
       } else {
-        const fetchedProducts = await this.fetchProducts(
-          {
-            brand: '',
-            device: '',
-            page: 1,
-            pageSize: missingIds.length,
-            sort: 'relevance'
-          },
-          { id: { in: missingIds } }
-        );
+        const fetchedProducts = await (this.traceService
+          ? this.traceService.startSpan('repo.products.fetch_missing_cards', () =>
+              this.fetchProducts(
+                {
+                  brand: '',
+                  device: '',
+                  page: 1,
+                  pageSize: missingIds.length,
+                  sort: 'relevance'
+                },
+                { id: { in: missingIds } }
+              )
+            )
+          : this.fetchProducts(
+              {
+                brand: '',
+                device: '',
+                page: 1,
+                pageSize: missingIds.length,
+                sort: 'relevance'
+              },
+              { id: { in: missingIds } }
+            ));
 
         await Promise.all(
           fetchedProducts.map((product) => {

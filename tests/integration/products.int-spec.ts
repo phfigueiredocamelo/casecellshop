@@ -8,6 +8,9 @@ import { ProductsService } from '../../apps/api/src/products/products.service';
 import { CacheService } from '../../libs/cache/src/cache.service';
 import { PrismaService } from '../../libs/db/src/prisma.service';
 import { MetricsController } from '../../libs/observability/src/metrics.controller';
+import { LoggerService } from '../../libs/observability/src/logger.service';
+import { RequestContextService } from '../../libs/observability/src/request-context.service';
+import { TraceService } from '../../libs/observability/src/trace.service';
 
 describe('api observability foundation', () => {
   it('exposes health and metrics endpoints through the app graph', async () => {
@@ -143,6 +146,66 @@ describe('api observability foundation', () => {
         inStock: true
       })
     ]);
+  });
+
+  it('logs cache misses and traces product fetches when populating a query', async () => {
+    const loggerInfo = jest.fn();
+    const loggerWarn = jest.fn();
+    const requestContext = new RequestContextService();
+    const logger = new LoggerService(requestContext);
+    const trace = new TraceService(requestContext, logger);
+    const traceSpy = jest.spyOn(trace, 'startSpan').mockImplementation(async (_op, callback) => callback());
+    jest.spyOn(logger, 'info').mockImplementation(loggerInfo);
+    jest.spyOn(logger, 'warn').mockImplementation(loggerWarn);
+
+    const service = new ProductsService(
+      {
+        catalogVersion: {
+          findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 99 })
+        },
+        product: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'prod-1',
+              sku: 'SKU-1',
+              name: 'Capa iPhone 15',
+              imageUrl: null,
+              brand: 'CaseCell',
+              price: { priceCents: 5990, currency: 'BRL' },
+              inventory: { availableQty: 7 }
+            }
+          ])
+        }
+      } as any,
+      {
+        getJson: jest.fn().mockResolvedValue(null),
+        setJson: jest.fn().mockResolvedValue(undefined),
+        acquireLock: jest.fn().mockResolvedValue(true),
+        releaseLock: jest.fn().mockResolvedValue(undefined)
+      } as any,
+      {
+        recordCacheHit: jest.fn(),
+        recordCacheMiss: jest.fn(),
+        recordProductCardHydrationMiss: jest.fn()
+      } as any,
+      logger,
+      trace
+    );
+
+    const response = await service.listProducts({
+      device: 'apple-iphone-15'
+    });
+
+    expect(response.items).toHaveLength(1);
+    expect(traceSpy).toHaveBeenCalledWith('repo.products.fetch', expect.any(Function));
+    expect(loggerInfo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: 'products.cache_miss_populated',
+        cache: 'products_query'
+      }),
+      'products cache miss populated'
+    );
+    expect(loggerWarn).not.toHaveBeenCalled();
   });
 
   it('hydrates cached product ids with a single batched product lookup', async () => {
