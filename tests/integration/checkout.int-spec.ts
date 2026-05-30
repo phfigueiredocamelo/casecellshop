@@ -248,4 +248,73 @@ describe('checkout', () => {
       'inventory:prod-hot'
     ]);
   });
+
+  it('records checkout observability metrics, logs, and spans', async () => {
+    const { prisma } = createPrismaStub();
+    const productsService = {
+      invalidateAvailability: jest.fn().mockResolvedValue(undefined)
+    };
+    const metrics = {
+      recordCheckoutStarted: jest.fn(),
+      recordCheckoutAccepted: jest.fn(),
+      recordCheckoutRejectedOutOfStock: jest.fn(),
+      recordCheckoutDuration: jest.fn(),
+      recordIdempotencyDuplicate: jest.fn()
+    };
+    const logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn()
+    };
+    const requestContext = {
+      setOrderId: jest.fn()
+    };
+    const trace = {
+      startSpan: jest.fn(async (_operation: string, callback: () => Promise<any> | any) => callback())
+    };
+    const service = new CheckoutService(
+      prisma as any,
+      productsService as any,
+      metrics as any,
+      logger as any,
+      requestContext as any,
+      trace as any
+    );
+    const controller = new CheckoutController(service);
+    const response = { status: jest.fn() } as any;
+
+    const first = await controller.checkout(
+      'customer-observe',
+      'idem-observe',
+      { items: [{ productId: 'prod-1', quantity: 1 }] },
+      response
+    );
+    const second = await controller.checkout(
+      'customer-observe',
+      'idem-observe',
+      { items: [{ productId: 'prod-1', quantity: 1 }] },
+      response
+    );
+
+    expect(first).toMatchObject({
+      orderId: 'order-1',
+      status: 'PENDING_ERP'
+    });
+    expect(second).toEqual(first);
+    expect(response.status).toHaveBeenNthCalledWith(1, 202);
+    expect(response.status).toHaveBeenNthCalledWith(2, 200);
+    expect(metrics.recordCheckoutStarted).toHaveBeenCalledTimes(2);
+    expect(metrics.recordCheckoutAccepted).toHaveBeenCalledTimes(1);
+    expect(metrics.recordIdempotencyDuplicate).toHaveBeenCalledTimes(1);
+    expect(metrics.recordCheckoutDuration).toHaveBeenCalledTimes(2);
+    expect(trace.startSpan).toHaveBeenCalledWith('checkout.process', expect.any(Function));
+    expect(requestContext.setOrderId).toHaveBeenCalledWith('order-1');
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: 'checkout.accepted',
+        orderId: 'order-1'
+      }),
+      'checkout accepted'
+    );
+  });
 });

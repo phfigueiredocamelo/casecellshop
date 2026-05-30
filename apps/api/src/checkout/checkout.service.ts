@@ -2,11 +2,18 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Optional,
   UnprocessableEntityException
 } from '@nestjs/common';
 import { IdempotencyStatus, Prisma, OrderStatus } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../../../../libs/db/src';
+import {
+  LoggerService,
+  MetricsService,
+  RequestContextService,
+  TraceService
+} from '../../../../libs/observability/src';
 import { ProductsService } from '../products/products.service';
 
 export interface CheckoutItemInput {
@@ -45,7 +52,11 @@ export class CheckoutService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly productsService: ProductsService
+    private readonly productsService: ProductsService,
+    @Optional() private readonly metricsService?: MetricsService,
+    @Optional() private readonly loggerService?: LoggerService,
+    @Optional() private readonly requestContext?: RequestContextService,
+    @Optional() private readonly traceService?: TraceService
   ) {}
 
   async checkout(
@@ -62,177 +73,452 @@ export class CheckoutService {
     }
 
     this.validateRequest(body);
+    this.metricsService?.recordCheckoutStarted();
+    this.loggerService?.info(
+      { operation: 'checkout.started', customerId, idempotencyKey },
+      'checkout started'
+    );
 
     const normalizedBody = this.normalizeRequest(body);
     const requestHash = this.hashRequest(normalizedBody);
     const cacheKeysToInvalidate = normalizedBody.items.map((item) => item.productId);
     const idempotencyLockKey = `${customerId}:${idempotencyKey}`;
     const inventoryLockKeys = [...new Set(normalizedBody.items.map((item) => item.productId))].sort();
+    const startedAt = process.hrtime.bigint();
+    let outcome: 'accepted' | 'idempotent' | 'error' = 'error';
 
-    const result = await this.runCheckoutTransactionWithRetry(() =>
-      this.prisma.$transaction(
-        async (tx) => {
-          await this.acquireIdempotencyLock(tx, idempotencyLockKey);
-          await this.acquireInventoryLocks(tx, inventoryLockKeys);
+    try {
+      const result = await (this.traceService
+        ? this.traceService.startSpan('checkout.process', () =>
+            this.runCheckoutTransactionWithRetry(() =>
+              this.prisma.$transaction(
+                async (tx) => {
+                  await this.acquireIdempotencyLock(tx, idempotencyLockKey);
+                  await this.acquireInventoryLocks(tx, inventoryLockKeys);
 
-          const existing = await tx.idempotencyKey.findUnique({
-            where: {
-              customerId_key: {
-                customerId,
-                key: idempotencyKey
-              }
-            }
-          });
+                  const existing = await tx.idempotencyKey.findUnique({
+                    where: {
+                      customerId_key: {
+                        customerId,
+                        key: idempotencyKey
+                      }
+                    }
+                  });
 
-          if (existing && existing.requestHash !== requestHash) {
-            throw new ConflictException('Idempotency key reused with different payload');
-          }
+                  if (existing && existing.requestHash !== requestHash) {
+                    throw new ConflictException('Idempotency key reused with different payload');
+                  }
 
-          if (existing?.status === IdempotencyStatus.COMPLETED && existing.responseBody) {
-            return {
-              httpStatus: 200,
-              body: existing.responseBody as unknown as CheckoutAcceptedResponse
-            };
-          }
+                  if (existing?.status === IdempotencyStatus.COMPLETED && existing.responseBody) {
+                    outcome = 'idempotent';
+                    this.metricsService?.recordIdempotencyDuplicate();
+                    if (existing.orderId) {
+                      this.requestContext?.setOrderId(existing.orderId);
+                    }
+                    this.loggerService?.info(
+                      {
+                        operation: 'checkout.idempotent_replay',
+                        customerId,
+                        idempotencyKey,
+                        orderId: existing.orderId
+                      },
+                      'checkout idempotent replay'
+                    );
 
-          if (existing?.status === IdempotencyStatus.PROCESSING) {
-            throw new ConflictException('Checkout already in progress for this idempotency key');
-          }
+                    return {
+                      httpStatus: 200,
+                      body: existing.responseBody as unknown as CheckoutAcceptedResponse
+                    };
+                  }
 
-          const products = await tx.product.findMany({
-            where: {
-              id: {
-                in: normalizedBody.items.map((item) => item.productId)
-              },
-              active: true
-            },
-            include: {
-              price: true
-            }
-          });
+                  if (existing?.status === IdempotencyStatus.PROCESSING) {
+                    throw new ConflictException('Checkout already in progress for this idempotency key');
+                  }
 
-          if (products.length !== normalizedBody.items.length) {
-            throw new UnprocessableEntityException('One or more products are unavailable');
-          }
+                  const products = await tx.product.findMany({
+                    where: {
+                      id: {
+                        in: normalizedBody.items.map((item) => item.productId)
+                      },
+                      active: true
+                    },
+                    include: {
+                      price: true
+                    }
+                  });
 
-          const pricedItems: PricedItem[] = normalizedBody.items.map((item) => {
-            const product = products.find((candidate) => candidate.id === item.productId);
+                  if (products.length !== normalizedBody.items.length) {
+                    this.metricsService?.recordCheckoutRejectedOutOfStock();
+                    this.loggerService?.warn(
+                      {
+                        operation: 'checkout.rejected_out_of_stock',
+                        customerId,
+                        idempotencyKey
+                      },
+                      'checkout rejected out of stock'
+                    );
+                    throw new UnprocessableEntityException('One or more products are unavailable');
+                  }
 
-            if (!product?.price) {
-              throw new UnprocessableEntityException(`Product ${item.productId} has no price`);
-            }
+                  const pricedItems: PricedItem[] = normalizedBody.items.map((item) => {
+                    const product = products.find((candidate) => candidate.id === item.productId);
 
-            return {
-              productId: product.id,
-              sku: product.sku,
-              productName: product.name,
-              quantity: item.quantity,
-              unitPriceCents: product.price.priceCents
-            };
-          });
+                    if (!product?.price) {
+                      throw new UnprocessableEntityException(`Product ${item.productId} has no price`);
+                    }
 
-          for (const item of normalizedBody.items) {
-            const updated = await tx.inventory.updateMany({
-              where: {
-                productId: item.productId,
-                availableQty: {
-                  gte: item.quantity
-                }
-              },
-              data: {
-                availableQty: {
-                  decrement: item.quantity
+                    return {
+                      productId: product.id,
+                      sku: product.sku,
+                      productName: product.name,
+                      quantity: item.quantity,
+                      unitPriceCents: product.price.priceCents
+                    };
+                  });
+
+                  for (const item of normalizedBody.items) {
+                    const updated = await tx.inventory.updateMany({
+                      where: {
+                        productId: item.productId,
+                        availableQty: {
+                          gte: item.quantity
+                        }
+                      },
+                      data: {
+                        availableQty: {
+                          decrement: item.quantity
+                        },
+                        reservedQty: {
+                          increment: item.quantity
+                        },
+                        version: {
+                          increment: 1
+                        }
+                      }
+                    });
+
+                    if (updated.count !== 1) {
+                      this.metricsService?.recordCheckoutRejectedOutOfStock();
+                      this.loggerService?.warn(
+                        {
+                          operation: 'checkout.rejected_out_of_stock',
+                          customerId,
+                          idempotencyKey,
+                          productId: item.productId
+                        },
+                        'checkout rejected out of stock'
+                      );
+                      throw new UnprocessableEntityException('Insufficient stock');
+                    }
+                  }
+
+                  const totalCents = pricedItems.reduce(
+                    (sum, item) => sum + item.quantity * item.unitPriceCents,
+                    0
+                  );
+
+                  const order = await tx.order.create({
+                    data: {
+                      customerId,
+                      idempotencyKey,
+                      status: OrderStatus.PENDING_ERP,
+                      totalCents,
+                      currency: 'BRL',
+                      items: {
+                        create: pricedItems.map((item) => ({
+                          productId: item.productId,
+                          sku: item.sku,
+                          productName: item.productName,
+                          quantity: item.quantity,
+                          unitPriceCents: item.unitPriceCents
+                        }))
+                      }
+                    },
+                    include: {
+                      items: true
+                    }
+                  });
+
+                  this.requestContext?.setOrderId(order.id);
+
+                  const responseBody: CheckoutAcceptedResponse = {
+                    orderId: order.id,
+                    status: order.status,
+                    totalCents: order.totalCents,
+                    currency: order.currency
+                  };
+
+                  await tx.outboxEvent.create({
+                    data: {
+                      aggregateType: 'Order',
+                      aggregateId: order.id,
+                      eventType: 'OrderAccepted',
+                      payload: {
+                        orderId: order.id,
+                        customerId,
+                        idempotencyKey,
+                        totalCents: order.totalCents,
+                        currency: order.currency
+                      },
+                      status: 'PENDING',
+                      orderId: order.id
+                    }
+                  });
+
+                  await tx.idempotencyKey.create({
+                    data: {
+                      customerId,
+                      key: idempotencyKey,
+                      requestHash,
+                      orderId: order.id,
+                      status: IdempotencyStatus.COMPLETED,
+                      responseBody: responseBody as unknown as Prisma.InputJsonValue
+                    }
+                  });
+
+                  outcome = 'accepted';
+                  this.metricsService?.recordCheckoutAccepted();
+                  this.loggerService?.info(
+                    {
+                      operation: 'checkout.accepted',
+                      customerId,
+                      idempotencyKey,
+                      orderId: order.id,
+                      totalCents: order.totalCents
+                    },
+                    'checkout accepted'
+                  );
+
+                  return {
+                    httpStatus: 202,
+                    body: responseBody
+                  };
                 },
-                reservedQty: {
-                  increment: item.quantity
-                },
-                version: {
-                  increment: 1
+                {
+                  isolationLevel: Prisma.TransactionIsolationLevel.Serializable
                 }
-              }
-            });
+              )
+            )
+          )
+        : this.runCheckoutTransactionWithRetry(() =>
+            this.prisma.$transaction(
+              async (tx) => {
+                await this.acquireIdempotencyLock(tx, idempotencyLockKey);
+                await this.acquireInventoryLocks(tx, inventoryLockKeys);
 
-            if (updated.count !== 1) {
-              throw new UnprocessableEntityException('Insufficient stock');
-            }
-          }
+                const existing = await tx.idempotencyKey.findUnique({
+                  where: {
+                    customerId_key: {
+                      customerId,
+                      key: idempotencyKey
+                    }
+                  }
+                });
 
-          const totalCents = pricedItems.reduce(
-            (sum, item) => sum + item.quantity * item.unitPriceCents,
-            0
-          );
+                if (existing && existing.requestHash !== requestHash) {
+                  throw new ConflictException('Idempotency key reused with different payload');
+                }
 
-          const order = await tx.order.create({
-            data: {
-              customerId,
-              idempotencyKey,
-              status: OrderStatus.PENDING_ERP,
-              totalCents,
-              currency: 'BRL',
-              items: {
-                create: pricedItems.map((item) => ({
-                  productId: item.productId,
-                  sku: item.sku,
-                  productName: item.productName,
-                  quantity: item.quantity,
-                  unitPriceCents: item.unitPriceCents
-                }))
-              }
-            },
-            include: {
-              items: true
-            }
-          });
+                if (existing?.status === IdempotencyStatus.COMPLETED && existing.responseBody) {
+                  outcome = 'idempotent';
+                  this.metricsService?.recordIdempotencyDuplicate();
+                  if (existing.orderId) {
+                    this.requestContext?.setOrderId(existing.orderId);
+                  }
+                  this.loggerService?.info(
+                    {
+                      operation: 'checkout.idempotent_replay',
+                      customerId,
+                      idempotencyKey,
+                      orderId: existing.orderId
+                    },
+                    'checkout idempotent replay'
+                  );
 
-          const responseBody: CheckoutAcceptedResponse = {
-            orderId: order.id,
-            status: order.status,
-            totalCents: order.totalCents,
-            currency: order.currency
-          };
+                  return {
+                    httpStatus: 200,
+                    body: existing.responseBody as unknown as CheckoutAcceptedResponse
+                  };
+                }
 
-          await tx.outboxEvent.create({
-            data: {
-              aggregateType: 'Order',
-              aggregateId: order.id,
-              eventType: 'OrderAccepted',
-              payload: {
-                orderId: order.id,
-                customerId,
-                idempotencyKey,
-                totalCents: order.totalCents,
-                currency: order.currency
+                if (existing?.status === IdempotencyStatus.PROCESSING) {
+                  throw new ConflictException('Checkout already in progress for this idempotency key');
+                }
+
+                const products = await tx.product.findMany({
+                  where: {
+                    id: {
+                      in: normalizedBody.items.map((item) => item.productId)
+                    },
+                    active: true
+                  },
+                  include: {
+                    price: true
+                  }
+                });
+
+                if (products.length !== normalizedBody.items.length) {
+                  this.metricsService?.recordCheckoutRejectedOutOfStock();
+                  this.loggerService?.warn(
+                    {
+                      operation: 'checkout.rejected_out_of_stock',
+                      customerId,
+                      idempotencyKey
+                    },
+                    'checkout rejected out of stock'
+                  );
+                  throw new UnprocessableEntityException('One or more products are unavailable');
+                }
+
+                const pricedItems: PricedItem[] = normalizedBody.items.map((item) => {
+                  const product = products.find((candidate) => candidate.id === item.productId);
+
+                  if (!product?.price) {
+                    throw new UnprocessableEntityException(`Product ${item.productId} has no price`);
+                  }
+
+                  return {
+                    productId: product.id,
+                    sku: product.sku,
+                    productName: product.name,
+                    quantity: item.quantity,
+                    unitPriceCents: product.price.priceCents
+                  };
+                });
+
+                for (const item of normalizedBody.items) {
+                  const updated = await tx.inventory.updateMany({
+                    where: {
+                      productId: item.productId,
+                      availableQty: {
+                        gte: item.quantity
+                      }
+                    },
+                    data: {
+                      availableQty: {
+                        decrement: item.quantity
+                      },
+                      reservedQty: {
+                        increment: item.quantity
+                      },
+                      version: {
+                        increment: 1
+                      }
+                    }
+                  });
+
+                  if (updated.count !== 1) {
+                    this.metricsService?.recordCheckoutRejectedOutOfStock();
+                    this.loggerService?.warn(
+                      {
+                        operation: 'checkout.rejected_out_of_stock',
+                        customerId,
+                        idempotencyKey,
+                        productId: item.productId
+                      },
+                      'checkout rejected out of stock'
+                    );
+                    throw new UnprocessableEntityException('Insufficient stock');
+                  }
+                }
+
+                const totalCents = pricedItems.reduce(
+                  (sum, item) => sum + item.quantity * item.unitPriceCents,
+                  0
+                );
+
+                const order = await tx.order.create({
+                  data: {
+                    customerId,
+                    idempotencyKey,
+                    status: OrderStatus.PENDING_ERP,
+                    totalCents,
+                    currency: 'BRL',
+                    items: {
+                      create: pricedItems.map((item) => ({
+                        productId: item.productId,
+                        sku: item.sku,
+                        productName: item.productName,
+                        quantity: item.quantity,
+                        unitPriceCents: item.unitPriceCents
+                      }))
+                    }
+                  },
+                  include: {
+                    items: true
+                  }
+                });
+
+                this.requestContext?.setOrderId(order.id);
+
+                const responseBody: CheckoutAcceptedResponse = {
+                  orderId: order.id,
+                  status: order.status,
+                  totalCents: order.totalCents,
+                  currency: order.currency
+                };
+
+                await tx.outboxEvent.create({
+                  data: {
+                    aggregateType: 'Order',
+                    aggregateId: order.id,
+                    eventType: 'OrderAccepted',
+                    payload: {
+                      orderId: order.id,
+                      customerId,
+                      idempotencyKey,
+                      totalCents: order.totalCents,
+                      currency: order.currency
+                    },
+                    status: 'PENDING',
+                    orderId: order.id
+                  }
+                });
+
+                await tx.idempotencyKey.create({
+                  data: {
+                    customerId,
+                    key: idempotencyKey,
+                    requestHash,
+                    orderId: order.id,
+                    status: IdempotencyStatus.COMPLETED,
+                    responseBody: responseBody as unknown as Prisma.InputJsonValue
+                  }
+                });
+
+                outcome = 'accepted';
+                this.metricsService?.recordCheckoutAccepted();
+                this.loggerService?.info(
+                  {
+                    operation: 'checkout.accepted',
+                    customerId,
+                    idempotencyKey,
+                    orderId: order.id,
+                    totalCents: order.totalCents
+                  },
+                  'checkout accepted'
+                );
+
+                return {
+                  httpStatus: 202,
+                  body: responseBody
+                };
               },
-              status: 'PENDING',
-              orderId: order.id
-            }
-          });
+              {
+                isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+              }
+            )
+          ));
 
-          await tx.idempotencyKey.create({
-            data: {
-              customerId,
-              key: idempotencyKey,
-              requestHash,
-              orderId: order.id,
-              status: IdempotencyStatus.COMPLETED,
-              responseBody: responseBody as unknown as Prisma.InputJsonValue
-            }
-          });
+      await this.productsService.invalidateAvailability(cacheKeysToInvalidate);
 
-          return {
-            httpStatus: 202,
-            body: responseBody
-          };
-        },
-        {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable
-        }
-      )
-    );
-
-    await this.productsService.invalidateAvailability(cacheKeysToInvalidate);
-
-    return result;
+      return result;
+    } finally {
+      this.metricsService?.recordCheckoutDuration({
+        outcome,
+        durationSeconds: Number(process.hrtime.bigint() - startedAt) / 1_000_000_000
+      });
+    }
   }
 
   private validateRequest(body: CheckoutRequest) {
