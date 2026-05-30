@@ -23,10 +23,11 @@ A solucao sera um monorepo Node.js/NestJS com multiplos processos:
 - Worker de faturamento para integrar pedidos com o ERP.
 - Worker base de conciliacao e sincronizacao ERP -> loja, com runner acionado pela API administrativa no corte atual.
 - Fake ERP para simular catalogo, estoque, faturamento e falhas.
-- Observabilidade basica com `/health`, `/metrics`, metricas HTTP/cache e logger estruturado.
+- Observabilidade obrigatoria com `/health`, `/metrics`, metricas HTTP/cache/checkout/fila, logger estruturado, contexto de correlacao e tracing stub.
+- Contrato OpenAPI ou equivalente com schemas de sucesso e erro para os endpoints publicos da API.
 - Testes de integracao Jest e cenarios K6 locais via Docker.
 
-Nao entram no escopo: front-end, pagamento real, autenticacao completa, CDC real, Kubernetes, dashboard completo ou microsservicos em repositorios separados.
+Nao entram no escopo: front-end, pagamento real, autenticacao completa, CDC real, Kubernetes, dashboard completo em ferramenta externa ou microsservicos em repositorios separados.
 
 ## Arquitetura Geral
 
@@ -166,7 +167,7 @@ ERP_FAILED    tentativas esgotadas, mensagem enviada para DLQ
 
 O status inicial do pedido criado pelo checkout e `PENDING_ERP`. A resposta HTTP continua sendo `202 Accepted`, mas o estado persistido ja representa que o pedido aguarda integracao assincrona.
 
-Divergencias encontradas pela conciliacao sao reportadas no retorno administrativo e em metricas planejadas. O enum atual de pedido nao possui `NEEDS_REVIEW`; esse estado fica como possivel evolucao se a revisao operacional precisar ser persistida no pedido.
+Divergencias encontradas pela conciliacao sao reportadas no retorno administrativo e na metrica `reconciliation_divergences_total`. O enum atual de pedido nao possui `NEEDS_REVIEW`; esse estado fica como possivel evolucao se a revisao operacional precisar ser persistida no pedido.
 
 ## Endpoints REST
 
@@ -183,6 +184,27 @@ GET /orders/by-idempotency-key/:key
 
 POST /admin/sync/erp
 POST /admin/reconcile
+```
+
+Contrato obrigatorio:
+
+- A API deve expor documentacao OpenAPI em `/docs` e o contrato bruto em `/openapi.json`, preferencialmente via `@nestjs/swagger`.
+- O contrato deve declarar DTOs de request e response para produtos, checkout, pedidos, endpoints administrativos, health e metrics quando aplicavel.
+- Cada endpoint deve documentar respostas de sucesso e erro esperadas, incluindo `400`, `404`, `409`, `422` e `500` quando fizer sentido.
+- O schema padrao de erro deve conter `statusCode`, `error`, `message`, `requestId`, `correlationId` e, quando existir no contexto, `orderId`.
+- O contrato deve documentar os headers `X-Customer-Id`, `Idempotency-Key` e `X-Correlation-Id`.
+
+Schema minimo de erro:
+
+```json
+{
+  "statusCode": 409,
+  "error": "Conflict",
+  "message": "Idempotency key reused with different payload",
+  "requestId": "req_01HX...",
+  "correlationId": "corr_01HX...",
+  "orderId": "ord_01HX..."
+}
 ```
 
 O fake ERP expoe separadamente:
@@ -485,11 +507,20 @@ Fluxo de conciliacao:
 3. Se ERP faturou e loja nao atualizou, corrige para `BILLED`.
 4. Se loja tem pedido sem invoice no ERP, conta divergencia no retorno administrativo.
 
-Comparacao amostral de preco/estoque e metrica `reconciliation_divergences_total` continuam como extensoes planejadas.
+Comparacao de divergencias de pedidos deve alimentar a metrica obrigatoria `reconciliation_divergences_total`. Comparacao amostral de preco/estoque permanece como extensao possivel.
 
 ## Observabilidade
 
-O modulo `observability` ja expoe `/metrics` em formato Prometheus e registra metricas HTTP por interceptor global. Tambem existe `LoggerService` com Pino para logs JSON; alguns workers ainda usam `Logger` padrao do Nest, mas a base para logs estruturados ja esta no monorepo.
+O modulo `observability` deve ser tratado como parte obrigatoria da entrega, nao como detalhe auxiliar. Ele expoe `/metrics` em formato Prometheus, registra metricas HTTP por interceptor global, padroniza logs JSON com Pino e propaga contexto de correlacao entre API, cache, banco, RabbitMQ, fake ERP e workers.
+
+### Contexto de correlacao
+
+Cada request HTTP recebe:
+
+- `requestId`: gerado pela API para identificar a chamada local.
+- `correlationId`: lido de `X-Correlation-Id` quando enviado pelo cliente; caso contrario, gerado pela API.
+
+A API deve devolver `X-Request-Id` e `X-Correlation-Id` na resposta. O `correlationId` deve ser gravado no payload da outbox, publicado nos headers do RabbitMQ e reutilizado pelo `order-worker`, `outbox-worker` e `reconciliation-worker`. Quando o fluxo ja tiver `orderId`, esse campo deve aparecer em logs, metricas com label de baixa cardinalidade apenas quando seguro, tentativas de integracao e mensagens de fila.
 
 Logs estruturados em JSON devem conter, quando aplicavel:
 
@@ -509,6 +540,8 @@ error.message
 error.stack
 ```
 
+O uso do `Logger` padrao do Nest nos workers deve ser substituido ou encapsulado para manter esse formato. Logs de erro devem registrar `error.message`, `error.stack` e o nome da excecao sem serializar objetos gigantes ou payloads sensiveis.
+
 Eventos essenciais:
 
 - cache hit, miss e fallback para Postgres;
@@ -520,41 +553,95 @@ Eventos essenciais:
 - tentativa de faturamento no ERP;
 - retry, DLQ e conciliacao.
 
-Metricas implementadas em formato Prometheus:
+### Metricas obrigatorias
+
+Metricas obrigatorias em formato Prometheus:
 
 ```text
 http_request_duration_seconds
 cache_hits_total
 cache_misses_total
 product_card_hydration_misses_total
-metricas default do prom-client
-```
-
-Metricas ainda planejadas:
-
-```text
 redis_operation_duration_seconds
 checkout_started_total
 orders_accepted_total
 orders_rejected_out_of_stock_total
+checkout_processing_duration_seconds
 idempotency_duplicate_total
 outbox_pending_total
+outbox_published_total
+outbox_publish_failed_total
 rabbitmq_queue_messages
 rabbitmq_dlq_messages
 worker_processing_duration_seconds
+worker_retries_total
 erp_request_duration_seconds
 erp_errors_total
 reconciliation_divergences_total
+metricas default do prom-client
+```
+
+Labels devem evitar alta cardinalidade. `route`, `method`, `status`, `cache`, `operation`, `worker`, `queue` e `outcome` sao aceitaveis. `orderId`, `requestId` e `correlationId` pertencem aos logs e traces, nao a metricas agregadas.
+
+### Tracing
+
+A entrega deve incluir trace/span real ou stub justificado. Para manter o ambiente local simples, o desenho aprovado usa um `TraceService` stub:
+
+```text
+traceId
+spanId
+parentSpanId
+service
+operation
+startedAt
+durationMs
+status
+correlationId
+requestId
+orderId
+```
+
+O stub cria spans para:
+
+- request HTTP de entrada;
+- leitura e escrita no Redis;
+- consulta ao repo/banco local;
+- chamada ao fake ERP;
+- criacao e publicacao da outbox;
+- consumo no `order-worker`;
+- retry, DLQ e reconciliacao.
+
+Esses spans sao emitidos como logs estruturados com `event=span.finished`. O motivo para nao subir Jaeger, OpenTelemetry Collector ou Datadog Agent no compose e manter a mini-tarefa reproduzivel com poucas dependencias. O README deve documentar essa decisao e indicar que o `TraceService` pode ser trocado por OpenTelemetry preservando a propagacao de `traceId`, `spanId` e `correlationId`.
+
+Fluxo de trace esperado no checkout:
+
+```text
+HTTP POST /checkout
+  span checkout.validate_idempotency
+  span repo.inventory.reserve
+  span repo.order.create
+  span outbox.create
+outbox-worker publish
+  span rabbitmq.publish orders.billing.q
+order-worker consume
+  span rabbitmq.consume orders.billing.q
+  span fake_erp.billing
+  span repo.order.mark_billed
 ```
 
 ## Testes
 
-Testes de integracao atuais:
+Testes de integracao atuais e obrigatorios:
 
 - bootstrap da API, fake ERP e workers de longa duracao.
 - `/health` e `/metrics` atraves do grafo Nest.
 - interceptor HTTP registrando `http_request_duration_seconds`.
 - metricas de cache e `product_card_hydration_misses_total`.
+- contrato OpenAPI expondo schemas de sucesso e erro.
+- middleware/filtro HTTP propagando `requestId` e `correlationId`.
+- logs estruturados incluindo `correlationId`, `requestId` e `orderId` quando existir.
+- metricas de checkout, outbox, fila, retry, DLQ, ERP e worker.
+- tracing stub emitindo spans para request, cache, repo local, fake ERP, fila e worker.
 - chave canonica de cache para queries de produto.
 - filtro por `device` usando compatibilidade.
 - hidratacao de IDs cacheados com `MGET` e uma unica busca batelada no Postgres.
@@ -655,6 +742,77 @@ npm run k6:checkout
 npm run k6:idempotency
 ```
 
+O README tambem deve documentar:
+
+- decisoes, trade-offs e limitacoes da arquitetura;
+- instrucoes completas para rodar localmente, testar e executar K6;
+- prompts de IA usados durante o desenvolvimento;
+- local do contrato OpenAPI (`/docs` e `/openapi.json`);
+- exemplo de dashboard Prometheus/Datadog-equivalente;
+- alertas e runbook operacional para incidentes comuns.
+
+Exemplo minimo de dashboard:
+
+```text
+Painel Catalogo
+  p95 http_request_duration_seconds{route="/products"}
+  cache hit ratio = cache_hits_total / (cache_hits_total + cache_misses_total)
+  product_card_hydration_misses_total
+
+Painel Checkout
+  checkout_processing_duration_seconds p95/p99
+  orders_accepted_total
+  orders_rejected_out_of_stock_total
+  idempotency_duplicate_total
+
+Painel Fila e ERP
+  outbox_pending_total
+  outbox_publish_failed_total
+  rabbitmq_queue_messages{queue="orders.billing.q"}
+  rabbitmq_dlq_messages{queue="orders.billing.dlq"}
+  worker_processing_duration_seconds
+  erp_errors_total
+```
+
+Alertas sugeridos:
+
+```text
+CacheMissAlto
+  cache miss ratio > 40% por 10 minutos em /products.
+
+CheckoutLento
+  p95 checkout_processing_duration_seconds > 1s por 5 minutos.
+
+FilaAcumulando
+  rabbitmq_queue_messages{queue="orders.billing.q"} > 100 por 10 minutos.
+
+DLQComMensagens
+  rabbitmq_dlq_messages{queue="orders.billing.dlq"} > 0 por 5 minutos.
+
+ERPFalhando
+  erp_errors_total cresce por 5 minutos.
+```
+
+Runbook minimo:
+
+```text
+Checkout com erro ou latencia alta
+  1. Filtrar logs por correlationId/requestId retornado ao cliente.
+  2. Verificar checkout_processing_duration_seconds e erros HTTP 409/422/5xx.
+  3. Conferir estoque local, idempotency_keys e locks/retry P2034.
+
+Cache miss alto
+  1. Verificar Redis e cache_hits_total/cache_misses_total por cache.
+  2. Rodar POST /admin/sync/erp se a versao de catalogo estiver stale.
+  3. Conferir spans cache.get/cache.set e product_card_hydration_misses_total.
+
+Fila acumulando ou DLQ
+  1. Abrir RabbitMQ Management UI.
+  2. Filtrar logs por orderId/correlationId.
+  3. Verificar integration_attempts e erp_errors_total.
+  4. Rodar conciliacao administrativa depois de recuperar o fake ERP.
+```
+
 ## Trade-offs
 
 - `X-Customer-Id` substitui autenticacao real.
@@ -664,7 +822,7 @@ npm run k6:idempotency
 - Falha persistente no ERP vira excecao operacional, sem devolucao automatica de estoque.
 - Produtos removidos do ERP viram `active=false`, sem hard delete.
 - A loja tem consistencia forte interna; ERP e integrado com consistencia eventual.
-- `/metrics` e logs estruturados bastam para observabilidade local; as metricas de negocio ainda sao incrementais.
+- `/metrics`, logs estruturados e tracing stub bastam para observabilidade local; OpenTelemetry/Datadog real fica como evolucao porque exigiria collector ou agent externo.
 - RabbitMQ local com retry por TTL demonstra backoff e DLQ sem complexidade extra.
 - `docker-compose.yml` sobe infraestrutura; apps e workers rodam localmente via `npm run start:stack`.
 - O repo usa `prisma db push` para setup local e ainda nao versiona migrations.
@@ -686,5 +844,9 @@ A mini-tarefa sera considerada bem desenhada se demonstrar:
 - faturamento assincrono com retry e DLQ;
 - sincronizacao e conciliacao ERP -> loja;
 - workers autonomos executando ciclos/consumo sem chamada manual;
-- logs, metricas e testes suficientes para explicar operacao e confiabilidade;
+- contrato OpenAPI com schemas de sucesso e erro;
+- logs estruturados com `correlationId`, `requestId` e `orderId` quando existir;
+- metricas de cache hit/miss, checkout, outbox, fila, retry, DLQ, ERP e workers;
+- trace/span real ou stub justificado ligando request, cache, repo fake, fila e worker;
+- README com dashboard, alertas, runbook, decisoes, limitacoes, instrucoes e prompts de IA;
 - suite K6 local via Docker para smoke, catalogo, cache, checkout concorrente e idempotencia.
