@@ -1,7 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { createHash } from 'crypto';
 import { CacheService } from '../../../../libs/cache/src';
 import { PrismaService } from '../../../../libs/db/src';
+import { MetricsService } from '../../../../libs/observability/src';
 
 export interface ProductQuery {
   brand?: string;
@@ -25,11 +27,17 @@ export interface ProductListItem {
 
 type ProductQueryCacheEntry = string[];
 
+interface HydratedProducts {
+  items: ProductListItem[];
+  missingProductCardIds: string[];
+}
+
 @Injectable()
 export class ProductsService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly cache: CacheService
+    private readonly cache: CacheService,
+    @Optional() private readonly metricsService?: MetricsService
   ) {}
 
   async listProducts(query: ProductQuery) {
@@ -39,15 +47,24 @@ export class ProductsService {
     const cachedIds = await this.cache.getJson<ProductQueryCacheEntry>(queryKey).catch(() => null);
 
     if (cachedIds) {
-      const items = await this.hydrateProducts(catalogVersion, cachedIds);
+      const hydrated = await this.hydrateProducts(catalogVersion, cachedIds);
+      const meta = {
+        ...normalized,
+        catalogVersion,
+        cache: 'hit'
+      };
+
+      if (hydrated.missingProductCardIds.length > 0) {
+        Object.assign(meta, {
+          degraded: true,
+          missingProductCardIds: hydrated.missingProductCardIds,
+          missingProductCards: hydrated.missingProductCardIds.length
+        });
+      }
 
       return {
-        items,
-        meta: {
-          ...normalized,
-          catalogVersion,
-          cache: 'hit'
-        }
+        items: hydrated.items,
+        meta
       };
     }
 
@@ -197,9 +214,15 @@ export class ProductsService {
     }));
   }
 
-  private async hydrateProducts(catalogVersion: number, ids: string[]) {
+  private async hydrateProducts(
+    catalogVersion: number,
+    ids: string[]
+  ): Promise<HydratedProducts> {
     if (ids.length === 0) {
-      return [];
+      return {
+        items: [],
+        missingProductCardIds: []
+      };
     }
 
     const cacheKeys = ids.map((id) => `product:card:v${catalogVersion}:${id}`);
@@ -207,42 +230,109 @@ export class ProductsService {
       .getJsonMany<ProductListItem>(cacheKeys)
       .catch(() => ids.map(() => null));
     const productsById = new Map<string, ProductListItem>();
-    const missingIds: string[] = [];
+    this.collectCachedProducts(ids, cachedProducts, productsById);
+    const missingIds = this.findMissingProductIds(ids, productsById);
 
+    if (missingIds.length === 0) {
+      return {
+        items: this.orderHydratedProducts(ids, productsById),
+        missingProductCardIds: []
+      };
+    }
+
+    const lockKey = this.buildProductHydrationLockKey(catalogVersion, missingIds);
+    const hasLock = await this.cache.acquireLock(lockKey, 5).catch(() => false);
+
+    try {
+      if (!hasLock) {
+        await this.sleep(this.getHydrationRetryJitterMs());
+
+        const rereadKeys = missingIds.map((id) => `product:card:v${catalogVersion}:${id}`);
+        const rereadProducts = await this.cache
+          .getJsonMany<ProductListItem>(rereadKeys)
+          .catch(() => missingIds.map(() => null));
+
+        this.collectCachedProducts(missingIds, rereadProducts, productsById);
+      } else {
+        const fetchedProducts = await this.fetchProducts(
+          {
+            brand: '',
+            device: '',
+            page: 1,
+            pageSize: missingIds.length,
+            sort: 'relevance'
+          },
+          { id: { in: missingIds } }
+        );
+
+        await Promise.all(
+          fetchedProducts.map((product) => {
+            productsById.set(product.id, product);
+
+            return this.cacheProductCard(catalogVersion, product);
+          })
+        );
+      }
+    } finally {
+      if (hasLock) {
+        await this.cache.releaseLock(lockKey).catch(() => undefined);
+      }
+    }
+
+    const missingProductCardIds = ids.filter((id) => !productsById.has(id));
+
+    if (missingProductCardIds.length > 0) {
+      this.metricsService?.recordProductCardHydrationMiss(missingProductCardIds.length);
+    }
+
+    return {
+      items: this.orderHydratedProducts(ids, productsById),
+      missingProductCardIds
+    };
+  }
+
+  private collectCachedProducts(
+    ids: string[],
+    cachedProducts: Array<ProductListItem | null>,
+    productsById: Map<string, ProductListItem>
+  ) {
     ids.forEach((id, index) => {
       const cachedProduct = cachedProducts[index];
 
       if (cachedProduct) {
         productsById.set(id, cachedProduct);
-      } else {
-        missingIds.push(id);
       }
     });
+  }
 
-    if (missingIds.length > 0) {
-      const fetchedProducts = await this.fetchProducts(
-        {
-          brand: '',
-          device: '',
-          page: 1,
-          pageSize: missingIds.length,
-          sort: 'relevance'
-        },
-        { id: { in: missingIds } }
-      );
+  private findMissingProductIds(ids: string[], productsById: Map<string, ProductListItem>) {
+    return ids.filter((id) => !productsById.has(id));
+  }
 
-      await Promise.all(
-        fetchedProducts.map((product) => {
-          productsById.set(product.id, product);
-
-          return this.cacheProductCard(catalogVersion, product);
-        })
-      );
-    }
-
+  private orderHydratedProducts(
+    ids: string[],
+    productsById: Map<string, ProductListItem>
+  ) {
     return ids
       .map((id) => productsById.get(id) ?? null)
       .filter((product): product is ProductListItem => product !== null);
+  }
+
+  private buildProductHydrationLockKey(catalogVersion: number, missingIds: string[]) {
+    const hash = createHash('sha256')
+      .update([...missingIds].sort().join(','))
+      .digest('hex')
+      .slice(0, 16);
+
+    return `lock:product:hydrate:v${catalogVersion}:${hash}`;
+  }
+
+  private getHydrationRetryJitterMs() {
+    return 25 + Math.floor(Math.random() * 50);
+  }
+
+  private sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private async cacheProductCard(catalogVersion: number, product: ProductListItem) {

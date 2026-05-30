@@ -22,6 +22,11 @@ export class MetricsService {
     labelNames: ['cache'],
     registers: [this.registry]
   });
+  readonly productCardHydrationMissesTotal = new Counter({
+    name: 'product_card_hydration_misses_total',
+    help: 'Count of product cards that could not be hydrated from cache refill',
+    registers: [this.registry]
+  });
 
   constructor() {
     collectDefaultMetrics({ register: this.registry });
@@ -44,6 +49,10 @@ export class MetricsService {
 
   recordCacheMiss(cache: string) {
     this.cacheMissesTotal.labels(cache).inc();
+  }
+
+  recordProductCardHydrationMiss(count: number) {
+    this.productCardHydrationMissesTotal.inc(count);
   }
 
   async getMetrics() {

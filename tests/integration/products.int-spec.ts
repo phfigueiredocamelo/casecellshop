@@ -64,8 +64,10 @@ describe('api observability foundation', () => {
     expect(metricsResponse).toContain('cache_hits_total');
 
     app.get(MetricsService).recordCacheHit('products');
+    app.get(MetricsService).recordProductCardHydrationMiss(2);
     const updatedMetricsResponse = await app.get(MetricsController).getMetrics();
     expect(updatedMetricsResponse).toContain('cache_hits_total{cache="products"} 1');
+    expect(updatedMetricsResponse).toContain('product_card_hydration_misses_total 2');
 
     await app.close();
   });
@@ -182,7 +184,7 @@ describe('api observability foundation', () => {
         getJson,
         getJsonMany,
         setJson: jest.fn().mockResolvedValue(undefined),
-        acquireLock: jest.fn().mockResolvedValue(false),
+        acquireLock: jest.fn().mockResolvedValue(true),
         releaseLock: jest.fn().mockResolvedValue(undefined)
       } as any
     );
@@ -202,6 +204,68 @@ describe('api observability foundation', () => {
       })
     );
     expect(response.items.map((item) => item.id)).toEqual(['prod-1', 'prod-2']);
+  });
+
+  it('returns partial hydrated products when another worker owns the missing card refill', async () => {
+    const cachedProduct = {
+      id: 'prod-1',
+      sku: 'SKU-1',
+      name: 'Capa iPhone 15',
+      imageUrl: null,
+      brand: 'CaseCell',
+      priceCents: 5990,
+      currency: 'BRL',
+      availableQty: 7,
+      inStock: true
+    };
+    const findMany = jest.fn();
+    const recordProductCardHydrationMiss = jest.fn();
+    const getJson = jest.fn().mockResolvedValue(['prod-1', 'prod-2']);
+    const getJsonMany = jest
+      .fn()
+      .mockResolvedValueOnce([cachedProduct, null])
+      .mockResolvedValueOnce([null]);
+    const acquireLock = jest.fn().mockResolvedValue(false);
+    const service = new ProductsService(
+      {
+        catalogVersion: {
+          findUnique: jest.fn().mockResolvedValue({ key: 'catalog', version: 13 })
+        },
+        product: {
+          findMany
+        }
+      } as any,
+      {
+        getJson,
+        getJsonMany,
+        setJson: jest.fn().mockResolvedValue(undefined),
+        acquireLock,
+        releaseLock: jest.fn().mockResolvedValue(undefined)
+      } as any,
+      {
+        recordProductCardHydrationMiss
+      } as any
+    );
+
+    const response = await service.listProducts({
+      device: 'apple-iphone-15'
+    });
+
+    expect(findMany).not.toHaveBeenCalled();
+    expect(acquireLock).toHaveBeenCalledWith(
+      expect.stringMatching(/^lock:product:hydrate:v13:[a-f0-9]{16}$/),
+      5
+    );
+    expect(response.items).toEqual([cachedProduct]);
+    expect(response.meta).toEqual(
+      expect.objectContaining({
+        cache: 'hit',
+        degraded: true,
+        missingProductCardIds: ['prod-2'],
+        missingProductCards: 1
+      })
+    );
+    expect(recordProductCardHydrationMiss).toHaveBeenCalledWith(1);
   });
 
   it('warms product card caches when populating a product query cache miss', async () => {
