@@ -1,6 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../../apps/api/src/app.module';
+import { configureOpenApi } from '../../apps/api/src/main';
 import { CacheService } from '../../libs/cache/src';
 import { PrismaService } from '../../libs/db/src';
 
@@ -30,6 +31,7 @@ export async function createApiTestApp(): Promise<INestApplication> {
 
   const app = moduleRef.createNestApplication({ logger: false });
 
+  configureOpenApi(app);
   await app.init();
 
   return app;
