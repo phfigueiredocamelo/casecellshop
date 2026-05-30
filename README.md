@@ -9,7 +9,7 @@ CaseCellShop is a backend demo for an e-commerce flow with catalog sync, checkou
 ```bash
 cp .env.example .env
 docker compose up -d postgres redis rabbitmq
-npm install
+npm install --legacy-peer-deps
 npm run build
 npm run prisma:generate
 DATABASE_URL=postgresql://casecellshop:casecellshop@localhost:5432/casecellshop XDG_CACHE_HOME=.cache ./node_modules/.bin/prisma db push --accept-data-loss --force-reset
@@ -201,7 +201,7 @@ Prepare the local stack and demo catalog:
 ```bash
 cp .env.example .env
 docker compose up -d postgres redis rabbitmq
-npm install
+npm install --legacy-peer-deps
 npm run build
 npm run prisma:generate
 DATABASE_URL=postgresql://casecellshop:casecellshop@localhost:5432/casecellshop XDG_CACHE_HOME=.cache ./node_modules/.bin/prisma db push --accept-data-loss --force-reset
