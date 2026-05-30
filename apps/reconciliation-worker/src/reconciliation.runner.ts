@@ -1,6 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { CacheService } from '../../../libs/cache/src';
 import { PrismaService } from '../../../libs/db/src';
+import {
+  LoggerService,
+  MetricsService,
+  TraceService
+} from '../../../libs/observability/src';
 import { ErpCatalogClient } from './erp-catalog.client';
 
 @Injectable()
@@ -8,11 +13,18 @@ export class ReconciliationRunner {
   constructor(
     private readonly prisma: PrismaService,
     private readonly erpCatalogClient: ErpCatalogClient,
-    private readonly cache: CacheService
+    private readonly cache: CacheService,
+    private readonly metricsService?: MetricsService,
+    private readonly loggerService?: LoggerService,
+    private readonly traceService?: TraceService
   ) {}
 
   async syncCatalog() {
-    const erpProducts = await this.erpCatalogClient.getProducts();
+    const erpProducts = await (this.traceService
+      ? this.traceService.startSpan('reconciliation.sync_catalog', () =>
+          this.erpCatalogClient.getProducts()
+        )
+      : this.erpCatalogClient.getProducts());
     const activeIds = erpProducts.map((product) => product.id);
 
     for (const erpProduct of erpProducts) {
@@ -147,6 +159,11 @@ export class ReconciliationRunner {
       }
     });
 
+    this.loggerService?.info(
+      { operation: 'reconciliation.sync_catalog', synced: erpProducts.length, catalogVersion: catalogVersion.version },
+      'reconciliation catalog sync complete'
+    );
+
     return {
       synced: erpProducts.length,
       catalogVersion: catalogVersion.version
@@ -185,6 +202,14 @@ export class ReconciliationRunner {
       if (!billing?.invoiceId) {
         divergences += 1;
       }
+    }
+
+    if (divergences > 0) {
+      this.metricsService?.recordReconciliationDivergence(divergences);
+      this.loggerService?.warn(
+        { operation: 'reconciliation.divergence', divergences },
+        'reconciliation divergences detected'
+      );
     }
 
     return {
