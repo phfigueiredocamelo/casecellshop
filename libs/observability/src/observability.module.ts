@@ -6,6 +6,7 @@ import { LoggerModule } from './logger.module';
 import { MetricsController } from './metrics.controller';
 import { MetricsService } from './metrics.service';
 import { RequestContextMiddleware } from './request-context.middleware';
+import { TraceService } from './trace.service';
 
 @Global()
 @Module({
@@ -15,6 +16,7 @@ import { RequestContextMiddleware } from './request-context.middleware';
     MetricsService,
     RequestContextMiddleware,
     HttpErrorFilter,
+    TraceService,
     HttpMetricsInterceptor,
     {
       provide: APP_INTERCEPTOR,
@@ -28,7 +30,8 @@ import { RequestContextMiddleware } from './request-context.middleware';
   exports: [
     LoggerModule,
     MetricsService,
-    RequestContextMiddleware
+    RequestContextMiddleware,
+    TraceService
   ]
 })
 export class ObservabilityModule {}
