@@ -267,7 +267,12 @@ describe('checkout', () => {
       error: jest.fn()
     };
     const requestContext = {
-      setOrderId: jest.fn()
+      setOrderId: jest.fn(),
+      get: jest.fn().mockReturnValue({
+        correlationId: 'corr-observe',
+        requestId: 'req-observe',
+        traceId: 'trace-observe'
+      })
     };
     const trace = {
       startSpan: jest.fn(async (_operation: string, callback: () => Promise<any> | any) => callback())

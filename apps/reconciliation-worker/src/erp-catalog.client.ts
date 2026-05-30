@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { env } from '../../../libs/config/src';
 import { MetricsService, TraceService } from '../../../libs/observability/src';
 import { ErpCatalogProduct } from '../../../prisma/catalog-data';
@@ -6,8 +6,8 @@ import { ErpCatalogProduct } from '../../../prisma/catalog-data';
 @Injectable()
 export class ErpCatalogClient {
   constructor(
-    private readonly metricsService?: MetricsService,
-    private readonly traceService?: TraceService
+    @Optional() private readonly metricsService?: MetricsService,
+    @Optional() private readonly traceService?: TraceService
   ) {}
 
   async getProducts(): Promise<ErpCatalogProduct[]> {

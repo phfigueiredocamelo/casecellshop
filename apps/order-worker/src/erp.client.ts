@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { env } from '../../../libs/config/src';
 import { MetricsService, TraceService } from '../../../libs/observability/src';
 
@@ -10,8 +10,8 @@ export interface BillingReceipt {
 @Injectable()
 export class ErpBillingClient {
   constructor(
-    private readonly metricsService?: MetricsService,
-    private readonly traceService?: TraceService
+    @Optional() private readonly metricsService?: MetricsService,
+    @Optional() private readonly traceService?: TraceService
   ) {}
 
   async billOrder(orderId: string, billingKey: string): Promise<BillingReceipt> {

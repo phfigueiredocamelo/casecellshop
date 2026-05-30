@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { CacheService } from '../../../libs/cache/src';
 import { PrismaService } from '../../../libs/db/src';
 import {
@@ -14,9 +14,9 @@ export class ReconciliationRunner {
     private readonly prisma: PrismaService,
     private readonly erpCatalogClient: ErpCatalogClient,
     private readonly cache: CacheService,
-    private readonly metricsService?: MetricsService,
-    private readonly loggerService?: LoggerService,
-    private readonly traceService?: TraceService
+    @Optional() private readonly metricsService?: MetricsService,
+    @Optional() private readonly loggerService?: LoggerService,
+    @Optional() private readonly traceService?: TraceService
   ) {}
 
   async syncCatalog() {
